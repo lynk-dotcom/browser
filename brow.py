@@ -33,7 +33,8 @@ from lynkio import (
     json_response, framework_version,
 )
 
-import scanner                                   # CLONER: import
+import scanner  
+import cloner # CLONER: import
 
 HERE          = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR    = os.path.join(HERE, "static")
