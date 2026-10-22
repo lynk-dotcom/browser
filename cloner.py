@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
 """
-Lynkio Cloner — full page/session/DOM/storage capture, edit, and rehydration.
+Lynkio Cloner — full page/session/DOM/storage capture + rehydrate.
 
-Captures into a single gzipped JSON artifact per clone:
-    outer_html            post-rewrite DOM (with /proxy?url=… references)
-    server_cookies        origin → {name: {value, path, domain, …}}
-    document_cookies      client-visible non-HttpOnly cookies
-    local_storage         localStorage
-    session_storage       sessionStorage
-    indexeddb             every DB / store / index / record, with typed values
-    caches                CacheStorage entries (bodies base64)
-    opfs                  Origin Private File System tree + file bodies
-    dom_state             form values, scroll, canvas, media, shadow DOM
-    globals               JSON-safe window globals
-    injected              per-session injected snippets
-    history, origins      navigation trail
-    ua, viewport          metadata
-
-Persistence:
-    clones/<uuid>.json.gz
-    Bounded to MAX_CLONES (LRU by mtime).
+v2: single handler for GET+DELETE /clone/* (Lynkio routing returns 405
+when a path matches but the method is missing on the first-matched route;
+combining avoids that trap).
 """
 
-import asyncio
 import base64
 import copy
 import gzip
@@ -166,7 +150,6 @@ def list_clones():
 # ======================================================================
 
 def capture_from_client(sess, payload):
-    """Turn a client capture payload + live Session into a persisted clone."""
     target_url = (payload.get("target_url") or sess.last_origin or "").strip()
     outer_html = payload.get("outer_html") or ""
     if not outer_html:
@@ -248,7 +231,6 @@ def state_payload(clone):
 
 
 def build_clone_html(clone):
-    """Insert hydrate bootstrap at the top of <head>."""
     html = clone["outer_html"]
     state = state_payload(clone)
     blob = json.dumps(state, separators=(",", ":")).encode("utf-8")
@@ -311,7 +293,7 @@ def install(app, ctx):
             new = True
         return vid, new
 
-    # ---- capture from live page ------------------------------------
+    # ---- capture from live page (exact POST) -----------------------
     @app.route("/clone/capture-client", methods=["POST"])
     async def clone_capture_client(req):
         sid, _ = session_from_req(req)
@@ -339,7 +321,35 @@ def install(app, ctx):
             "source_url": clone["source_url"],
         })
 
-    # ---- clone sub-resources ---------------------------------------
+    # ---- import (exact POST) ---------------------------------------
+    @app.route("/clone/import", methods=["POST"])
+    async def clone_import(req):
+        body = req.body or b""
+        if len(body) > MAX_RAW_BYTES:
+            return json_response({"error": "too large"}, status=413)
+        try:
+            c = json.loads(body.decode("utf-8", "replace"))
+        except json.JSONDecodeError as e:
+            return json_response({"error": f"invalid JSON: {e}"}, status=400)
+        if "uuid" not in c or "outer_html" not in c:
+            return json_response({"error": "not a clone file"}, status=400)
+        c["uuid"] = _uuid.uuid4().hex[:16]
+        c.setdefault("created_at", time.time())
+        c.setdefault("edit_count", 0)
+        c.setdefault("last_edit_ts", 0)
+        try:
+            save_clone(c)
+        except ValueError as e:
+            return json_response({"error": str(e)}, status=413)
+        return json_response({"uuid": c["uuid"], "url": f"/clone/{c['uuid']}"})
+
+    # ---- list (exact GET) ------------------------------------------
+    @app.get("/clones")
+    async def clones_index(req):
+        return json_response({"clones": list_clones()})
+
+    # ---- per-clone sub-resources (specific wildcards) --------------
+    # These come BEFORE /clone/* so they match first within wild_routes.
     @app.get("/clone/*/state.json")
     async def clone_state_json(req, wildcard=""):
         cid = (wildcard or "").split("/", 1)[0].strip()
@@ -428,44 +438,22 @@ def install(app, ctx):
                         f'attachment; filename="{cid}.lynkclone"')
         return resp
 
-    @app.route("/clone/import", methods=["POST"])
-    async def clone_import(req):
-        body = req.body or b""
-        if len(body) > MAX_RAW_BYTES:
-            return json_response({"error": "too large"}, status=413)
-        try:
-            c = json.loads(body.decode("utf-8", "replace"))
-        except json.JSONDecodeError as e:
-            return json_response({"error": f"invalid JSON: {e}"}, status=400)
-        if "uuid" not in c or "outer_html" not in c:
-            return json_response({"error": "not a clone file"}, status=400)
-        c["uuid"] = _uuid.uuid4().hex[:16]
-        c.setdefault("created_at", time.time())
-        c.setdefault("edit_count", 0)
-        c.setdefault("last_edit_ts", 0)
-        try:
-            save_clone(c)
-        except ValueError as e:
-            return json_response({"error": str(e)}, status=413)
-        return json_response({"uuid": c["uuid"], "url": f"/clone/{c['uuid']}"})
-
-    @app.route("/clone/*", methods=["DELETE"])
-    async def clone_delete(req, wildcard=""):
-        cid = (wildcard or "").split("/", 1)[0].strip()
-        ok = delete_clone(cid)
-        return json_response({"ok": ok}, status=200 if ok else 404)
-
-    @app.get("/clones")
-    async def clones_index(req):
-        return json_response({"clones": list_clones()})
-
-    # ---- the actual clone page -------------------------------------
-    @app.get("/clone/*")
-    async def clone_open(req, wildcard=""):
+    # ---- serve OR delete a clone (ONE handler, both methods) -------
+    # Combining GET + DELETE avoids Lynkio's "path matches but method
+    # missing → 405 and stop" behaviour when two routes share the same
+    # wildcard pattern.
+    @app.route("/clone/*", methods=["GET", "DELETE"])
+    async def clone_route(req, wildcard=""):
         raw = (wildcard or "").split("?", 1)[0]
         cid = raw.split("/", 1)[0].strip()
         if not cid:
             return error_page("Clone not found", "Missing clone id.", 404)
+
+        if req.method == "DELETE":
+            ok = delete_clone(cid)
+            return json_response({"ok": ok}, status=200 if ok else 404)
+
+        # GET — serve the clone
         clone = load_clone(cid)
         if not clone:
             return error_page(
