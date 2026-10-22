@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Lynkio Browser — v18.1
+Lynkio Browser — v18.5
 Built on the lynkio framework v1.4.2.
 
-Cloner release — adds full page/session/DOM/storage cloning.
+Cloner release — full page/session/DOM/storage cloning.
+
+v18.5 fix: cloner.install() is registered BEFORE the /* catch-all so that
+/clone/* wildcard routes are matched first. Lynkio's wildcard dispatcher
+picks wildcard routes in registration order (see lynkio/server.py:
+`ordered = exact_routes + wild_routes`), and a path-matched-but-method-
+mismatched route returns 405 without falling through. Both behaviours
+had to be accounted for; cloner.py now combines GET+DELETE /clone/* into
+a single handler.
 """
 
 import asyncio
@@ -33,8 +41,8 @@ from lynkio import (
     json_response, framework_version,
 )
 
-import scanner  
-import cloner # CLONER: import
+import scanner
+import cloner
 
 HERE          = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR    = os.path.join(HERE, "static")
@@ -902,14 +910,14 @@ class HTMLRewriter:
         ui = soup.new_tag("script")
         ui["src"] = "/static/js/ui.js"
 
-        clonerc = soup.new_tag("script")                       # CLONER: script tag
-        clonerc["src"] = "/static/js/cloner_capture.js"        # CLONER
+        clonerc = soup.new_tag("script")
+        clonerc["src"] = "/static/js/cloner_capture.js"
 
         head.insert(0, boot)
         head.insert(1, ctx_s)
         head.insert(2, icpt)
         head.insert(3, ui)
-        head.insert(4, clonerc)                                # CLONER: insert
+        head.insert(4, clonerc)
 
         for snip in self.ctx.get("_injected", []):
             target = soup.body or soup.html or soup
@@ -4333,6 +4341,24 @@ async def proxy_route(req):
     return await serve_proxied(req, target, sid)
 
 
+# ======================================================================
+# CLONER — install BEFORE /* so wildcard dispatch picks /clone/* first.
+# Lynkio wildcard dispatcher iterates in registration order and a path-
+# matched-but-method-mismatched route returns 405 (no fall-through), so
+# cloner.py also combines GET+DELETE /clone/* into one handler.
+# ======================================================================
+cloner.install(app, {
+    "get_session":      get_session,
+    "Session":          Session,
+    "RawResponse":      RawResponse,
+    "json_response":    json_response,
+    "error_page":       error_page,
+    "SESSION_COOKIE":   SESSION_COOKIE,
+    "session_from_req": session_from_req,
+    "SESSIONS":         SESSIONS,
+})
+
+
 @app.route("/*", methods=["GET", "POST", "PUT", "PATCH",
                            "DELETE", "OPTIONS", "HEAD"])
 async def catch_all(req, wildcard=""):
@@ -4343,7 +4369,7 @@ async def catch_all(req, wildcard=""):
     if path_only == "/favicon.ico":
         return RawResponse(b"", status=204, content_type="image/x-icon")
 
-    if path_only.startswith(("/static/", "/lynkio/", "/tool/", "/__lynk_", "/clone/")):
+    if path_only.startswith(("/static/", "/lynkio/", "/tool/", "/__lynk_")):
         return error_page("Not found",
                           f"<code>{esc(path_only)}</code> not found.", 404)
 
@@ -4410,26 +4436,11 @@ async def healthz(req):
 
 
 # ======================================================================
-# CLONER — install all /clone/* routes                            [NEW]
-# ======================================================================
-cloner.install(app, {
-    "get_session":      get_session,
-    "Session":          Session,
-    "RawResponse":      RawResponse,
-    "json_response":    json_response,
-    "error_page":       error_page,
-    "SESSION_COOKIE":   SESSION_COOKIE,
-    "session_from_req": session_from_req,
-    "SESSIONS":         SESSIONS,
-})
-
-
-# ======================================================================
 # Boot
 # ======================================================================
 if __name__ == "__main__":
     print("=" * 68)
-    print(f"  🛠  Lynkio Browser — v18.1   (framework {framework_version})")
+    print(f"  🛠  Lynkio Browser — v18.5   (framework {framework_version})")
     print("=" * 68)
     print(f"  Home       →  http://localhost:{PORT}/")
     print(f"  Browser    →  http://localhost:{PORT}/tabs")
