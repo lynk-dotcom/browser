@@ -1,9 +1,12 @@
 /* Lynkio shell — tab strip, URL bar, console, palette, WS control plane,
    public API for the toolkit.
 
-   v18.2 additions:
-     • Cloner — capture any tab to /clone/<uuid>, open, list, inspect.
-     • All v18.1 features (zoom, desktop mode, layout) preserved.
+   v18.3 additions:
+     • Local Lynkio routes (/clone/*, /clones, /tabs, /static/*, /tool/*,
+       /__lynk_*, /) load directly in the iframe instead of going through
+       /proxy. This fixes clone pages 404'ing when opened inside Lynkio.
+     • Copy URL: toolbar button, tab context menu entry, Ctrl+Shift+C.
+     • All v18.2 features (cloner, zoom, desktop mode) preserved.
 */
 (function(){
 "use strict";
@@ -46,6 +49,7 @@ var tabList        = document.getElementById('tabs');
 var urlInput       = document.getElementById('urlInput');
 var urlLock        = document.getElementById('urlLock');
 var urlStar        = document.getElementById('urlStar');
+var urlCopy        = document.getElementById('urlCopy');
 var btnBack        = document.getElementById('btnBack');
 var btnFwd         = document.getElementById('btnFwd');
 var btnReload      = document.getElementById('btnReload');
@@ -94,6 +98,61 @@ function showToast(msg){
 function newId(){ return 't_' + Math.random().toString(36).slice(2,10); }
 function proxyURL(u){ return '/proxy?url=' + encodeURIComponent(u); }
 function isSecure(url){ return /^https:/i.test(url); }
+
+/* ---------- Local vs upstream routing ----------
+   A "local" URL is served by Lynkio itself (/clone/*, /clones, /tabs,
+   /static/*, /tool/*, /__lynk_*, /). These MUST be loaded directly in the
+   iframe — never proxied. Proxying them makes the server try to reach
+   browser-cl95.onrender.com/clone/<uuid> from its own network stack,
+   triggers the is_self_target recovery, and 404s. */
+function isLocalURL(url){
+  if (!url) return false;
+  try {
+    var u = new URL(url, location.origin);
+    if (u.origin !== location.origin) return false;
+    var p = u.pathname;
+    return p === '/'
+        || p === '/tabs'
+        || p === '/clones'
+        || p === '/healthz'
+        || p.indexOf('/clone/') === 0
+        || p.indexOf('/clones/') === 0
+        || p.indexOf('/static/') === 0
+        || p.indexOf('/tool/') === 0
+        || p.indexOf('/lynkio/') === 0
+        || p.indexOf('/__lynk_') === 0
+        || p.indexOf('/search') === 0;
+  } catch(e){ return false; }
+}
+
+function fullURL(url){
+  if (!url) return '';
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.charAt(0) === '/') return location.origin + url;
+  return url;
+}
+
+/* Copy an arbitrary URL string to the clipboard, with a toast. */
+function copyToClipboard(text, label){
+  if (!text) { showToast('Nothing to copy'); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(function(){
+      showToast(label || 'Copied');
+    }).catch(function(){ _copyFallback(text, label); });
+    return;
+  }
+  _copyFallback(text, label);
+}
+function _copyFallback(text, label){
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+    showToast(label || 'Copied');
+  } catch(e){ showToast('Copy failed'); }
+}
 
 function realURLFromProxied(href){
   try {
@@ -322,6 +381,10 @@ async function cloneActivePage(){
   }
 }
 
+/* Open a clone as a normal Lynkio tab.
+   Passes the ABSOLUTE clone URL so the URL bar shows a full, shareable URL.
+   addTab() detects the /clone/ prefix via isLocalURL() and loads it directly
+   (no /proxy wrapper) — that is what makes the clone render. */
 function openClone(uuid){
   if (!uuid) return;
   addTab(location.origin + '/clone/' + uuid,
@@ -334,6 +397,20 @@ async function listClones(){
     var j = await r.json();
     return (j && j.clones) || [];
   } catch(e){ return []; }
+}
+
+/* ============================================================
+   Copy URL
+   ============================================================ */
+function copyActiveURL(){
+  var t = activeTab();
+  if (!t || !t.url){ showToast('Nothing to copy'); return; }
+  var url = fullURL(t.url);
+  copyToClipboard(url, 'URL copied');
+  sendControlPlane('console', {
+    tab_id: t.id, level: 'info',
+    text: 'Copied URL: ' + url, src: 'shell.js'
+  });
 }
 
 /* ============================================================
@@ -355,7 +432,10 @@ function addTab(url, opts){
   frame.setAttribute('sandbox',
     'allow-same-origin allow-scripts allow-forms allow-popups allow-modals '
     + 'allow-popups-to-escape-sandbox allow-downloads allow-top-navigation-by-user-activation');
-  if (url) frame.src = proxyURL(url);
+
+  /* KEY FIX: local Lynkio routes load directly; only real upstreams proxy. */
+  if (url) frame.src = isLocalURL(url) ? fullURL(url) : proxyURL(url);
+
   stack.appendChild(frame);
   tab.frame = frame;
   tabs.push(tab);
@@ -376,8 +456,11 @@ function addTab(url, opts){
       }
       var dt = frame.contentDocument && frame.contentDocument.title;
       if (dt && dt.trim()){
-        tab.title = dt.trim().slice(0, 60);
-        if (id === activeId) document.title = tab.title + ' · Lynk';
+        /* preserve the "Clone · <uuid>" title we set when opening clones */
+        if (!(tab.title && tab.title.indexOf('Clone · ') === 0)){
+          tab.title = dt.trim().slice(0, 60);
+          if (id === activeId) document.title = tab.title + ' · Lynk';
+        }
       }
     } catch(e){}
     markTabIdle(tab);
@@ -472,7 +555,8 @@ function navigateCurrent(url, push){
   t.title = url.replace(/^https?:\/\//,'').slice(0, 60);
   t.error = false;
   markTabBusy(t);
-  if (t.frame) t.frame.src = proxyURL(url);
+  /* KEY FIX: same rule here — local routes are loaded directly. */
+  if (t.frame) t.frame.src = isLocalURL(url) ? fullURL(url) : proxyURL(url);
   urlInput.value = url;
   updateURLLock(url);
   updateURLStar(url);
@@ -485,7 +569,10 @@ function reloadActive(){
   var t = activeTab();
   if (!t || !t.frame) return;
   markTabBusy(t);
-  try { t.frame.src = t.frame.src; } catch(e){}
+  try {
+    /* Rebuild src from tab.url so clone tabs stay on /clone/<uuid>. */
+    t.frame.src = isLocalURL(t.url) ? fullURL(t.url) : proxyURL(t.url);
+  } catch(e){}
 }
 function stopActive(){
   var t = activeTab();
@@ -644,6 +731,9 @@ urlStar.onclick = function(){
   }
   saveBookmarks(b); updateURLStar(t.url);
 };
+if (urlCopy){
+  urlCopy.onclick = copyActiveURL;
+}
 document.getElementById('newTab').onclick = function(){ addTab('https://duckduckgo.com'); };
 
 /* ============================================================
@@ -819,7 +909,9 @@ window.addEventListener('message', function(e){
         updateURLStar(real);
       }
     }
-    if (m.title) tab.title = String(m.title).slice(0,60);
+    if (m.title && !(tab.title && tab.title.indexOf('Clone · ') === 0)) {
+      tab.title = String(m.title).slice(0,60);
+    }
     markTabIdle(tab);
     renderTabs(); updateNavState(); saveTabs();
   } else if (type === 'lynk:push-state'){
@@ -873,6 +965,11 @@ function openCtx(x, y, tabId){
   function sep(){ var s = document.createElement('div'); s.className = 'ctx-sep'; return s; }
   ctxMenu.appendChild(mk('↻','Reload', function(){ activateTab(tabId); reloadActive(); }, 'Ctrl+R'));
   ctxMenu.appendChild(mk('⎘','Duplicate', function(){ duplicateTab(tabId); }));
+  ctxMenu.appendChild(mk('⧉','Copy URL', function(){
+    var tt = tabById(tabId);
+    if (!tt || !tt.url) return;
+    copyToClipboard(fullURL(tt.url), 'URL copied');
+  }, 'Ctrl+Shift+C'));
   ctxMenu.appendChild(sep());
   ctxMenu.appendChild(mk('✕','Close tab', function(){ closeTab(tabId); }, 'Ctrl+W', true));
   ctxMenu.appendChild(mk('⊘','Close others', function(){
@@ -921,6 +1018,7 @@ document.getElementById('mView').onclick = function(e){
     ['Zoom in',  function(){ setZoom(getZoom() + 0.1); }],
     ['Zoom out', function(){ setZoom(getZoom() - 0.1); }],
     ['Reset zoom', function(){ setZoom(1); }],
+    ['Copy current URL', copyActiveURL],
   ];
   if (isMobileOnlyViewport()){
     items.push(['Toggle desktop view', function(){
@@ -999,6 +1097,7 @@ document.addEventListener('keydown', function(e){
   else if (k === 'b'){ e.preventDefault(); drawerKit.classList.toggle('open'); }
   else if (k === '`' || k === '~'){ e.preventDefault(); drawerConsole.classList.toggle('open'); }
   else if (k === 'd'){ e.preventDefault(); urlStar.click(); }
+  else if (k === 'c' && e.shiftKey){ e.preventDefault(); copyActiveURL(); }
   else if (k === 't' && !e.shiftKey){ e.preventDefault(); addTab('https://duckduckgo.com'); }
   else if (k === 't' && e.shiftKey){ e.preventDefault(); reopenLast(); }
   else if (k === 'w'){ e.preventDefault(); if (activeId) closeTab(activeId); }
@@ -1077,7 +1176,7 @@ function connectLynk(){
     lynk.connect().then(function(){
       lynk.emit('subscribe', {
         tabs: tabs.map(function(t){ return t.id; }),
-        version: 'v18.2',
+        version: 'v18.3',
       });
     }).catch(function(){
       if (wsBadge){ wsBadge.textContent = '· WS ⚠'; wsBadge.style.color = '#f87171'; }
@@ -1162,6 +1261,11 @@ window.__LYNK__ = {
   clonePage:       cloneActivePage,
   openClone:       openClone,
   listClones:      listClones,
+  /* URL helpers */
+  isLocalURL:      isLocalURL,
+  fullURL:         fullURL,
+  copyActiveURL:   copyActiveURL,
+  copyURL:         copyToClipboard,
 };
 
 /* ============================================================
