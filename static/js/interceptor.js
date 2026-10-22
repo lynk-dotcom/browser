@@ -105,12 +105,14 @@ function isLocal(s){
     return r.indexOf('/proxy') === 0 || r.indexOf('/__lynk_') === 0
         || r.indexOf('/lynkio/') === 0 || r.indexOf('/static/') === 0
         || r.indexOf('/tool/') === 0 || r.indexOf('/tabs') === 0
+        || r.indexOf('/clone/') === 0 || r.indexOf('/clones') === 0
         || r === '/' || r === '';
   }
   if (s.charAt(0) === '/'){
     return s.indexOf('/proxy') === 0 || s.indexOf('/__lynk_') === 0
         || s.indexOf('/lynkio/') === 0 || s.indexOf('/static/') === 0
-        || s.indexOf('/tool/') === 0 || s.indexOf('/tabs') === 0;
+        || s.indexOf('/tool/') === 0 || s.indexOf('/tabs') === 0
+        || s.indexOf('/clone/') === 0 || s.indexOf('/clones') === 0;
   }
   return false;
 }
