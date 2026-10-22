@@ -1,6 +1,9 @@
 /* Lynkio toolkit — all tools (vulnerability scanner, agent, recon, osint,
    web, injection, http, cms, auth & cookies, enumeration, shell & takeover,
-   captcha, encode, payloads, cloner, customize). Mobile-first. */
+   captcha, encode, payloads, cloner, customize). Mobile-first.
+
+   v18.3: My Clones adds a "Copy URL" button so a clone can be shared to any
+   browser. */
 (function(){
 "use strict";
 if (window.__LYNK_TOOLKIT__) return;
@@ -1544,7 +1547,10 @@ reg('cloner', {
         + '<div class="result-list-item" data-open-url="' + esc(url) + '">'
         + '<b style="color:#38bdf8;">Open clone</b>'
         + '<span style="flex:1;color:#94a3b8;">' + esc(url) + '</span></div>'
-        + '<button class="btn small" data-copy="' + esc(url) + '">⧉ Copy URL</button>',
+        + '<div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">'
+        + '<button class="btn small" data-copy="' + esc(url) + '">⧉ Copy URL</button>'
+        + '<button class="btn small" data-open-url="' + esc(url) + '">Open</button>'
+        + '</div>',
       raw: r,
     };
   }
@@ -1552,7 +1558,7 @@ reg('cloner', {
 
 reg('cloner', {
   id:'clones_list', icon:'📚', name:'My Clones',
-  description:'List, open, edit or delete saved clones.',
+  description:'List, open, copy URL, edit or delete saved clones.',
   fields: [],
   run: async function(){
     var clones = await L.listClones();
@@ -1573,8 +1579,11 @@ reg('cloner', {
         + '</div>'
         + '<div style="font-size:10.5px;color:#64748b;font-family:ui-monospace,monospace;">'
         + esc(meta) + '</div>'
+        + '<div style="font-size:10.5px;color:#64748b;font-family:ui-monospace,monospace;word-break:break-all;">'
+        + esc(url) + '</div>'
         + '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
         + '<button class="btn small" data-clone-open="' + esc(c.uuid) + '">Open</button>'
+        + '<button class="btn small" data-clone-copy="' + esc(url) + '">⧉ Copy URL</button>'
         + '<button class="btn small" data-clone-view="' + esc(c.uuid) + '">Inspect</button>'
         + '<button class="btn small" data-clone-edit="' + esc(c.uuid) + '">Edit HTML</button>'
         + '<button class="btn small" data-clone-export="' + esc(c.uuid) + '">Export</button>'
@@ -1590,6 +1599,14 @@ function wireClonesList(){
   $.querySelectorAll('[data-clone-open]').forEach(function(b){
     if (b.__wired) return; b.__wired = true;
     b.onclick = function(){ L.openClone(b.getAttribute('data-clone-open')); };
+  });
+  $.querySelectorAll('[data-clone-copy]').forEach(function(b){
+    if (b.__wired) return; b.__wired = true;
+    b.onclick = function(){
+      var url = b.getAttribute('data-clone-copy');
+      if (L.copyURL) L.copyURL(url, 'URL copied');
+      else if (UI.copy) UI.copy(url);
+    };
   });
   $.querySelectorAll('[data-clone-view]').forEach(function(b){
     if (b.__wired) return; b.__wired = true;
