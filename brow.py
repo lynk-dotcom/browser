@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Lynkio Browser — v18.5
+Lynkio Browser — v18.6
 Built on the lynkio framework v1.4.2.
 
 Cloner release — full page/session/DOM/storage cloning.
 
-v18.5 fix: cloner.install() is registered BEFORE the /* catch-all so that
-/clone/* wildcard routes are matched first. Lynkio's wildcard dispatcher
-picks wildcard routes in registration order (see lynkio/server.py:
-`ordered = exact_routes + wild_routes`), and a path-matched-but-method-
-mismatched route returns 405 without falling through. Both behaviours
-had to be accounted for; cloner.py now combines GET+DELETE /clone/* into
-a single handler.
+v18.6 changes:
+  • New _json_for_script() helper escapes `</` and U+2028/U+2029 in every
+    JSON blob embedded inside a <script> tag. Without this, JSON payloads
+    containing `</script>` (common in Facebook / Instagram client-side
+    error blobs, Next.js __NEXT_DATA__, etc.) close the tag early and
+    the rest of the JSON is rendered as visible page text.
+  • Inject-snippet scripts also escape `</`.
+  • cloner.install() still registered BEFORE /* catch-all (v18.5 fix).
 """
 
 import asyncio
@@ -510,6 +511,21 @@ def esc(t):
                    .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _json_for_script(obj):
+    """
+    Return obj as a JSON string safe to embed inside a <script>...</script>.
+    Escapes `</` → `<\\/` so the browser parser doesn't see a closing tag
+    inside the JSON (which happens for Facebook / Instagram / Next.js
+    error payloads that contain `</script>` in strings). `\\/` is a valid
+    JSON escape for `/`, so parsing restores the original value exactly.
+    Also escapes U+2028 / U+2029 which would otherwise be line terminators.
+    """
+    s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    s = s.replace("</", "<\\/")
+    s = s.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return s
+
+
 def _decompress(body, encoding):
     enc = (encoding or "").lower().strip()
     if not enc or enc == "identity":
@@ -902,7 +918,7 @@ class HTMLRewriter:
         )
 
         ctx_s = soup.new_tag("script")
-        ctx_s.string = f"window.__LYNK_CTX__={json.dumps(self.ctx)};"
+        ctx_s.string = f"window.__LYNK_CTX__={_json_for_script(self.ctx)};"
 
         icpt = soup.new_tag("script")
         icpt["src"] = "/static/js/interceptor.js"
@@ -921,7 +937,10 @@ class HTMLRewriter:
 
         for snip in self.ctx.get("_injected", []):
             target = soup.body or soup.html or soup
-            s = soup.new_tag("script"); s.string = snip; target.append(s)
+            safe = snip.replace("</", "<\\/")
+            s = soup.new_tag("script")
+            s.string = safe
+            target.append(s)
 
         return str(soup).encode("utf-8", errors="ignore")
 
@@ -4343,9 +4362,6 @@ async def proxy_route(req):
 
 # ======================================================================
 # CLONER — install BEFORE /* so wildcard dispatch picks /clone/* first.
-# Lynkio wildcard dispatcher iterates in registration order and a path-
-# matched-but-method-mismatched route returns 405 (no fall-through), so
-# cloner.py also combines GET+DELETE /clone/* into one handler.
 # ======================================================================
 cloner.install(app, {
     "get_session":      get_session,
@@ -4440,13 +4456,14 @@ async def healthz(req):
 # ======================================================================
 if __name__ == "__main__":
     print("=" * 68)
-    print(f"  🛠  Lynkio Browser — v18.5   (framework {framework_version})")
+    print(f"  🛠  Lynkio Browser — v18.6   (framework {framework_version})")
     print("=" * 68)
     print(f"  Home       →  http://localhost:{PORT}/")
     print(f"  Browser    →  http://localhost:{PORT}/tabs")
     print(f"  Proxy      →  http://localhost:{PORT}/proxy?url=…")
     print(f"  Clones     →  http://localhost:{PORT}/clones")
     print(f"  Clone      →  http://localhost:{PORT}/clone/<uuid>")
+    print(f"  Editor     →  http://localhost:{PORT}/clone/<uuid>/edit")
     print(f"  WS         →  ws://localhost:{PORT}/__lynk_ws")
     print(f"  Tools      →  /tool/<name>   ({len(TOOLS)} registered)")
     print(f"  Static     →  /static/*   (from {STATIC_DIR})")
