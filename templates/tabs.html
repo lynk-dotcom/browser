@@ -68,9 +68,7 @@ transition:var(--t);flex-shrink:0}
 .zoom-level:active{transform:scale(0.94)}
 
 .desktop-toggle{display:none}
-@media(max-width:640px){
-  .desktop-toggle{display:grid}
-}
+@media(max-width:640px){.desktop-toggle{display:grid}}
 
 .status-pill{display:inline-flex;align-items:center;gap:5px;
 font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--fg-dim);flex-shrink:0}
@@ -80,6 +78,41 @@ box-shadow:0 0 6px rgba(16,185,129,.5);flex-shrink:0}
 .status-pill .dot.err{background:var(--danger)}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.55;transform:scale(.8)}}
 .ws-badge{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--fg-dim)}
+
+/* CDP bar */
+.cdp-bar{display:flex;align-items:center;gap:8px;flex-shrink:0;padding:4px 10px;
+height:32px;background:#0a1220;border-bottom:1px solid var(--line);
+padding-left:calc(10px + var(--safe-l));padding-right:calc(10px + var(--safe-r));
+overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.cdp-bar::-webkit-scrollbar{display:none}
+.cdp-label{font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+color:var(--fg-dim);flex-shrink:0}
+.cdp-strip{display:flex;gap:4px;align-items:center;flex:1;min-width:0}
+.cdp-tab{display:flex;align-items:center;gap:6px;padding:3px 9px;height:22px;
+border-radius:6px;background:rgba(148,163,184,.08);color:var(--fg-muted);
+font-size:11px;font-weight:600;cursor:pointer;max-width:200px;min-width:60px;
+white-space:nowrap;flex-shrink:0;border:1px solid transparent;transition:var(--t)}
+.cdp-tab:hover{background:rgba(56,189,248,.1);color:var(--accent);
+border-color:rgba(56,189,248,.3)}
+.cdp-tab.active{background:rgba(56,189,248,.15);color:var(--accent);
+border-color:rgba(56,189,248,.4)}
+.cdp-tab-title{overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.cdp-tab-url{font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--fg-dim);
+overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:100px}
+.cdp-status{font-family:'JetBrains Mono',monospace;font-size:10.5px;
+color:var(--fg-dim);flex-shrink:0;white-space:nowrap}
+.cdp-launch{padding:3px 10px;border-radius:6px;border:1px solid rgba(56,189,248,.35);
+background:transparent;color:var(--accent);font-family:inherit;font-size:11px;
+font-weight:700;cursor:pointer;flex-shrink:0}
+.cdp-launch:hover{background:rgba(56,189,248,.1)}
+.cdp-launch:disabled{opacity:.4;cursor:not-allowed}
+@media(max-width:640px){
+  .cdp-bar{height:28px;padding:3px 8px;
+    padding-left:calc(8px + var(--safe-l));padding-right:calc(8px + var(--safe-r))}
+  .cdp-label{display:none}
+  .cdp-tab{font-size:10px;padding:2px 7px;max-width:140px}
+  .cdp-tab-url{display:none}
+}
 
 .tab-strip{display:flex;align-items:center;gap:4px;flex-shrink:0;padding:4px 8px;height:38px;
 background:var(--bg-2);border-bottom:1px solid var(--line);
@@ -363,6 +396,13 @@ min-height:96px;min-width:0;overflow:hidden;-webkit-tap-highlight-color:transpar
     <span id="statusText">Ready</span>
     <span class="ws-badge" id="wsBadge">· WS —</span>
   </span>
+</div>
+
+<div class="cdp-bar" id="cdpBar">
+  <span class="cdp-label">Real&nbsp;Chrome</span>
+  <div class="cdp-strip" id="cdpStrip"></div>
+  <span class="cdp-status" id="cdpStatus">○ Connecting…</span>
+  <button class="cdp-launch" id="cdpLaunch">Launch Chrome</button>
 </div>
 
 <div class="tab-strip">
