@@ -1,1282 +1,484 @@
-/* Lynkio shell — tab strip, URL bar, console, palette, WS control plane,
-   public API for the toolkit.
+/* shell.js — Lynk shell bootstrap.
+ * Owns the tab strip, the address bar, iframe lifecycle, the interceptor
+ * message bridge, the service WebSocket, and dynamic chunk loading.
+ *
+ * This revision fixes the "[lynk] chunk not available: https://<upstream>/static/js/<file>"
+ * warnings caused by the chunk loader resolving chunk URLs against the active
+ * tab's upstream origin instead of the Lynk origin.
+ */
+(function () {
+  'use strict';
+  if (window.__LYNK_SHELL__) return;
+  window.__LYNK_SHELL__ = true;
 
-   v18.3 additions:
-     • Local Lynkio routes (/clone/*, /clones, /tabs, /static/*, /tool/*,
-       /__lynk_*, /) load directly in the iframe instead of going through
-       /proxy. This fixes clone pages 404'ing when opened inside Lynkio.
-     • Copy URL: toolbar button, tab context menu entry, Ctrl+Shift+C.
-     • All v18.2 features (cloner, zoom, desktop mode) preserved.
-*/
-(function(){
-"use strict";
-if (window.__LYNK_SHELL__) return;
-window.__LYNK_SHELL__ = true;
+  /* =================== CONSTANTS =================== */
 
-var LOAD_WATCHDOG   = 45000;
-var BOOKMARK_KEY    = '__lynk_bookmarks_v4';
-var ZOOM_KEY        = '__lynk_zoom_v4';
-var DESKTOP_KEY     = '__lynk_desktop_mode_v1';
-var TABS_KEY        = '__lynk_tabs_v1';
-var CONSOLE_MAX     = 2000;
-var CONSOLE_TOTAL   = 20000;
-var DESKTOP_VP_W    = 1280;
+  const ORIGIN       = location.origin;                 /* FIX-0: never changed by tab state */
+  const CHUNK_BASE   = ORIGIN + '/static/js/';          /* FIX-1: chunks ALWAYS come from Lynk origin */
+  const SERVICE_WS   = ORIGIN.replace(/^http/, 'ws') + '/__lynk_ws';
+  const VERSION      = window.__LYNK_VERSION__ || 'v1';
 
-/* ============================================================
-   State
-   ============================================================ */
-var tabs        = [];
-var activeId    = null;
-var lastClosed  = null;
-var loadingCount= 0;
-var progressTrickle = null;
-var progressDoneTimer = null;
-
-var consoleBuffers    = Object.create(null);
-var consoleTotalCount = 0;
-var consoleFilter     = 'all';
-var consoleOnlyActive = false;
-var consoleSeq        = 0;
-var consoleAutoScroll = true;
-
-var _layoutTimer      = null;
-
-/* ============================================================
-   DOM refs
-   ============================================================ */
-var stack          = document.getElementById('stack');
-var tabList        = document.getElementById('tabs');
-var urlInput       = document.getElementById('urlInput');
-var urlLock        = document.getElementById('urlLock');
-var urlStar        = document.getElementById('urlStar');
-var urlCopy        = document.getElementById('urlCopy');
-var btnBack        = document.getElementById('btnBack');
-var btnFwd         = document.getElementById('btnFwd');
-var btnReload      = document.getElementById('btnReload');
-var btnGo          = document.getElementById('btnGo');
-var progressEl     = document.getElementById('progress');
-var statusDot      = document.getElementById('statusDot');
-var statusText     = document.getElementById('statusText');
-var wsBadge        = document.getElementById('wsBadge');
-var stTabs         = document.getElementById('stTabs');
-var stLink         = document.getElementById('stLink');
-var stMeta         = document.getElementById('stMeta');
-var ctxMenu        = document.getElementById('ctxMenu');
-var toastEl        = document.getElementById('toast');
-var emptyEl        = document.getElementById('empty');
-var drawerConsole  = document.getElementById('drawerConsole');
-var drawerKit      = document.getElementById('drawerKit');
-var consoleList    = document.getElementById('consoleList');
-var consoleTotal   = document.getElementById('consoleTotal');
-var zoomLevelEl    = document.getElementById('zoomLevel');
-var desktopToggleEl= document.getElementById('desktopToggle');
-
-/* ============================================================
-   Utils
-   ============================================================ */
-function escHtml(s){
-  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  /* Explicit allowlist of chunks the shell is allowed to load.
+     Anything not in this map is refused — prevents a typo or a stale
+     reference from ever being resolved against an upstream origin. */
+  const KNOWN_CHUNKS = Object.freeze({
+    'ui.js':               'ui',
+    'toolkit.js':          'toolkit',
+    'cloner_capture.js':   'clonerCapture',
+    /* add future chunks here as you ship them */
   });
-}
-function dl(name, text){
-  try {
-    var blob = new Blob([text], {type:'text/plain;charset=utf-8'});
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = name;
-    document.body.appendChild(a); a.click();
-    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 500);
-  } catch(e){}
-}
-var toastTimer = null;
-function showToast(msg){
-  toastEl.textContent = msg;
-  toastEl.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(function(){ toastEl.classList.remove('show'); }, 2600);
-}
-function newId(){ return 't_' + Math.random().toString(36).slice(2,10); }
-function proxyURL(u){ return '/proxy?url=' + encodeURIComponent(u); }
-function isSecure(url){ return /^https:/i.test(url); }
 
-/* ---------- Local vs upstream routing ----------
-   A "local" URL is served by Lynkio itself (/clone/*, /clones, /tabs,
-   /static/*, /tool/*, /__lynk_*, /). These MUST be loaded directly in the
-   iframe — never proxied. Proxying them makes the server try to reach
-   browser-cl95.onrender.com/clone/<uuid> from its own network stack,
-   triggers the is_self_target recovery, and 404s. */
-function isLocalURL(url){
-  if (!url) return false;
-  try {
-    var u = new URL(url, location.origin);
-    if (u.origin !== location.origin) return false;
-    var p = u.pathname;
-    return p === '/'
-        || p === '/tabs'
-        || p === '/clones'
-        || p === '/healthz'
-        || p.indexOf('/clone/') === 0
-        || p.indexOf('/clones/') === 0
-        || p.indexOf('/static/') === 0
-        || p.indexOf('/tool/') === 0
-        || p.indexOf('/lynkio/') === 0
-        || p.indexOf('/__lynk_') === 0
-        || p.indexOf('/search') === 0;
-  } catch(e){ return false; }
-}
+  /* =================== CHUNK LOADER =================== */
 
-function fullURL(url){
-  if (!url) return '';
-  if (/^https?:\/\//i.test(url)) return url;
-  if (url.charAt(0) === '/') return location.origin + url;
-  return url;
-}
+  const chunkCache  = Object.create(null);   /* name -> module / null */
+  const chunkFailed = Object.create(null);   /* name -> true */
 
-/* Copy an arbitrary URL string to the clipboard, with a toast. */
-function copyToClipboard(text, label){
-  if (!text) { showToast('Nothing to copy'); return; }
-  if (navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(function(){
-      showToast(label || 'Copied');
-    }).catch(function(){ _copyFallback(text, label); });
-    return;
-  }
-  _copyFallback(text, label);
-}
-function _copyFallback(text, label){
-  try {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    document.execCommand('copy'); ta.remove();
-    showToast(label || 'Copied');
-  } catch(e){ showToast('Copy failed'); }
-}
+  /**
+   * Load a Lynk shell chunk by basename.
+   * Guarantees:
+   *  - The URL is built from CHUNK_BASE (Lynk origin), never from upstream.
+   *  - A file that is already in the DOM (server-injected) is reused, not refetched.
+   *  - A non-JS content-type is rejected before the browser tries to execute it,
+   *    which is what turns "facebook 404 HTML" into a clean warning instead of
+   *    a SyntaxError: Unexpected token '<'.
+   *  - Failures are cached so we don't retry every render.
+   */
+  function loadChunk(name, opts) {
+    if (chunkCache[name] !== undefined)  return Promise.resolve(chunkCache[name]);
+    if (chunkFailed[name])               return Promise.resolve(null);
 
-function realURLFromProxied(href){
-  try {
-    var u = new URL(href, location.origin);
-    if (u.pathname === '/proxy')  return u.searchParams.get('url') || '';
-    if (u.pathname === '/search'){
-      var q = u.searchParams.get('q') || '';
-      var e = u.searchParams.get('engine') || 'google';
-      return '/search?q=' + encodeURIComponent(q) + '&engine=' + encodeURIComponent(e);
+    if (!KNOWN_CHUNKS[name]) {
+      chunkFailed[name] = true;
+      return Promise.resolve(null);
     }
-  } catch(e){}
-  return '';
-}
 
-function clamp(v, lo, hi){ return v < lo ? lo : v > hi ? hi : v; }
-
-/* ============================================================
-   Progress
-   ============================================================ */
-function progressStart(){
-  clearTimeout(progressDoneTimer); clearInterval(progressTrickle);
-  progressEl.classList.remove('done','complete');
-  progressEl.classList.add('active');
-  progressEl.style.width = '5%';
-  requestAnimationFrame(function(){
-    setTimeout(function(){ progressEl.style.width = '22%'; }, 80);
-    setTimeout(function(){ progressEl.style.width = '48%'; }, 220);
-    setTimeout(function(){ progressEl.style.width = '68%'; }, 600);
-  });
-  progressTrickle = setInterval(function(){
-    var w = parseFloat(progressEl.style.width) || 0;
-    if (w < 92) progressEl.style.width = Math.min(92, w + Math.random() * 2.5) + '%';
-  }, 420);
-}
-function progressComplete(){
-  clearInterval(progressTrickle);
-  if (!progressEl.classList.contains('active') &&
-      !progressEl.classList.contains('complete')) return;
-  progressEl.classList.remove('active');
-  progressEl.classList.add('complete');
-  progressDoneTimer = setTimeout(function(){
-    progressEl.classList.add('done');
-    setTimeout(function(){
-      progressEl.style.width = '0';
-      progressEl.classList.remove('complete','done');
-    }, 340);
-  }, 240);
-}
-function setStatus(mode, text){
-  statusDot.className = 'dot' + (mode ? ' ' + mode : '');
-  statusText.textContent = text || 'Ready';
-}
-
-/* ============================================================
-   Tab model
-   ============================================================ */
-function activeTab(){
-  for (var i = 0; i < tabs.length; i++) if (tabs[i].id === activeId) return tabs[i];
-  return null;
-}
-function tabById(id){
-  for (var i = 0; i < tabs.length; i++) if (tabs[i].id === id) return tabs[i];
-  return null;
-}
-function findTabByWindow(w){
-  for (var i = 0; i < tabs.length; i++){
-    try { if (tabs[i].frame && tabs[i].frame.contentWindow === w) return tabs[i]; } catch(e){}
-  }
-  return null;
-}
-function activeTabURL(){ var t = activeTab(); return t ? t.url : ''; }
-function activeTabHost(){
-  try { return new URL(activeTabURL()).hostname; } catch(e){ return ''; }
-}
-function activeTabOrigin(){
-  try { var x = new URL(activeTabURL()); return x.protocol + '//' + x.host; } catch(e){ return ''; }
-}
-function getIframeDoc(t){
-  try {
-    var f = t && t.frame; if (!f) return null;
-    var d = f.contentDocument; if (!d || !d.body) return null;
-    return d;
-  } catch(e){ return null; }
-}
-
-function markTabBusy(tab){
-  if (!tab || tab.busy) return;
-  tab.busy = true; loadingCount++;
-  if (loadingCount === 1){ progressStart(); setStatus('busy', 'Loading…'); }
-  clearTimeout(tab._watchdog);
-  tab._watchdog = setTimeout(function(){
-    if (tab.busy){
-      addConsole(tab.id, 'warn',
-        'navigation watchdog fired (' + (LOAD_WATCHDOG/1000) + 's)', '');
-      markTabIdle(tab);
+    /* Reuse a server-injected script if it's already on the page. */
+    const existing = document.querySelector(
+      'script[src$="/static/js/' + name.replace(/\./g, '\\.') + '"]'
+    );
+    if (existing && existing.dataset.lynkLoaded === '1') {
+      chunkCache[name] = window[KNOWN_CHUNKS[name]] || null;
+      return Promise.resolve(chunkCache[name]);
     }
-  }, LOAD_WATCHDOG);
-  renderTabs(); updateNavState();
-}
-function markTabIdle(tab){
-  if (tab && tab.busy){
-    tab.busy = false; clearTimeout(tab._watchdog);
-    loadingCount = Math.max(0, loadingCount - 1);
-  }
-  if (loadingCount === 0){
-    progressComplete();
-    var t = activeTab();
-    setStatus(t && t.error ? 'err' : '', t && t.error ? 'Error' : 'Ready');
-  }
-  renderTabs(); updateNavState();
-}
-function updateNavState(){
-  var t = activeTab();
-  var busy = !!(t && t.busy);
-  btnGo.disabled = busy;
-  if (busy){ btnReload.textContent = '×'; btnReload.title = 'Stop (Esc)'; }
-  else     { btnReload.textContent = '⟳'; btnReload.title = 'Reload (Ctrl+R)'; }
-  btnBack.disabled = !t || t.hpos <= 0;
-  btnFwd.disabled  = !t || t.hpos >= t.history.length - 1;
-}
 
-/* ============================================================
-   Zoom + desktop mode
-   ============================================================ */
-function getZoom(){
-  var v = parseFloat(localStorage.getItem(ZOOM_KEY) || '1');
-  return isFinite(v) && v > 0 ? v : 1;
-}
-function getDesktopMode(){
-  try { return localStorage.getItem(DESKTOP_KEY) === '1'; } catch(e){ return false; }
-}
-function setDesktopModeRaw(on){
-  try { localStorage.setItem(DESKTOP_KEY, on ? '1' : '0'); } catch(e){}
-  if (desktopToggleEl){
-    desktopToggleEl.classList.toggle('active', !!on);
-    desktopToggleEl.setAttribute('aria-pressed', on ? 'true' : 'false');
-    desktopToggleEl.title = on ? 'Switch to mobile view' : 'Switch to desktop view';
-  }
-}
-function updateZoomDisplay(){
-  if (zoomLevelEl){
-    zoomLevelEl.textContent = Math.round(getZoom() * 100) + '%';
-  }
-}
-function isMobileOnlyViewport(){
-  try {
-    if (window.matchMedia && window.matchMedia('(max-width: 640px)').matches) return true;
-  } catch(e){}
-  return (('ontouchstart' in window) && window.innerWidth < 900);
-}
+    /* FIX-2: URL is built from the shell's own origin. */
+    const url = CHUNK_BASE + name + '?v=' + encodeURIComponent(VERSION);
 
-function applyFrameLayout(){
-  var t = activeTab();
-  if (!t || !t.frame) return;
-  var container = t.frame.parentElement;
-  if (!container) return;
-
-  var W = container.clientWidth || 400;
-  var H = container.clientHeight || 600;
-  var z = getZoom();
-  var desktop = getDesktopMode();
-
-  t.frame.style.transformOrigin = '0 0';
-
-  if (desktop && isMobileOnlyViewport()){
-    var vpW = DESKTOP_VP_W;
-    var fit = W / vpW;
-    var eff = fit * z;
-    if (!isFinite(eff) || eff < 0.05) eff = 0.05;
-    if (eff > 8) eff = 8;
-
-    var vpH = H / eff;
-    if (!isFinite(vpH) || vpH < 200) vpH = 200;
-
-    t.frame.style.width  = vpW + 'px';
-    t.frame.style.height = Math.round(vpH) + 'px';
-    t.frame.style.transform = 'scale(' + eff + ')';
-  } else {
-    if (Math.abs(z - 1) < 0.001){
-      t.frame.style.transform = '';
-      t.frame.style.width  = '100%';
-      t.frame.style.height = '100%';
-    } else {
-      t.frame.style.width  = (100 / z) + '%';
-      t.frame.style.height = (100 / z) + '%';
-      t.frame.style.transform = 'scale(' + z + ')';
-    }
-  }
-}
-
-function setZoom(z){
-  z = clamp(z, 0.4, 3);
-  z = Math.round(z * 10) / 10;
-  try { localStorage.setItem(ZOOM_KEY, String(z)); } catch(e){}
-  applyFrameLayout();
-  updateZoomDisplay();
-  showToast(Math.round(z * 100) + '% zoom');
-}
-
-/* ============================================================
-   Cloner — capture current tab to a persisted clone
-   ============================================================ */
-async function cloneActivePage(){
-  var t = activeTab();
-  if (!t || !t.frame){ showToast('No tab to clone'); return null; }
-  var win;
-  try { win = t.frame.contentWindow; } catch(e){ win = null; }
-  if (!win || typeof win.lynkCapture !== 'function'){
-    showToast('Capture helper not loaded — reload the tab');
-    return null;
-  }
-  showToast('Capturing full state…');
-  markTabBusy(t);
-  try {
-    var out = await win.lynkCapture();
-    if (!out || !out.uuid){
-      throw new Error((out && out.error) || 'capture failed');
-    }
-    showToast('Clone ready: /clone/' + out.uuid);
-    return out;
-  } catch(e){
-    showToast('Clone failed: ' + (e && e.message || e));
-    return null;
-  } finally {
-    markTabIdle(t);
-  }
-}
-
-/* Open a clone as a normal Lynkio tab.
-   Passes the ABSOLUTE clone URL so the URL bar shows a full, shareable URL.
-   addTab() detects the /clone/ prefix via isLocalURL() and loads it directly
-   (no /proxy wrapper) — that is what makes the clone render. */
-function openClone(uuid){
-  if (!uuid) return;
-  addTab(location.origin + '/clone/' + uuid,
-         { title: 'Clone · ' + uuid.slice(0,8) });
-}
-
-async function listClones(){
-  try {
-    var r = await fetch('/clones', { credentials: 'same-origin' });
-    var j = await r.json();
-    return (j && j.clones) || [];
-  } catch(e){ return []; }
-}
-
-/* ============================================================
-   Copy URL
-   ============================================================ */
-function copyActiveURL(){
-  var t = activeTab();
-  if (!t || !t.url){ showToast('Nothing to copy'); return; }
-  var url = fullURL(t.url);
-  copyToClipboard(url, 'URL copied');
-  sendControlPlane('console', {
-    tab_id: t.id, level: 'info',
-    text: 'Copied URL: ' + url, src: 'shell.js'
-  });
-}
-
-/* ============================================================
-   Tab lifecycle
-   ============================================================ */
-function addTab(url, opts){
-  opts = opts || {};
-  var id    = newId();
-  var title = url ? (opts.title || url.replace(/^https?:\/\//,'').slice(0,60)) : 'New tab';
-  var tab = {
-    id: id, url: url || '', title: title,
-    history: url ? [url] : [], hpos: url ? 0 : -1,
-    frame: null, busy: false, error: false, _watchdog: null,
-  };
-  var frame = document.createElement('iframe');
-  frame.className = 'frame';
-  frame.dataset.tabId = id;
-  frame.setAttribute('referrerpolicy', 'no-referrer');
-  frame.setAttribute('sandbox',
-    'allow-same-origin allow-scripts allow-forms allow-popups allow-modals '
-    + 'allow-popups-to-escape-sandbox allow-downloads allow-top-navigation-by-user-activation');
-
-  /* KEY FIX: local Lynkio routes load directly; only real upstreams proxy. */
-  if (url) frame.src = isLocalURL(url) ? fullURL(url) : proxyURL(url);
-
-  stack.appendChild(frame);
-  tab.frame = frame;
-  tabs.push(tab);
-
-  frame.addEventListener('load', function(){
-    tab.error = false;
-    try {
-      var finalURL = '';
-      try { finalURL = realURLFromProxied(frame.contentWindow.location.href); } catch(e){}
-      if (finalURL && finalURL !== tab.url){
-        tab.url = finalURL;
-        if (tab.history[tab.hpos] !== finalURL){
-          tab.history = tab.history.slice(0, tab.hpos + 1);
-          tab.history.push(finalURL);
-          tab.hpos = tab.history.length - 1;
+    return fetch(url, { credentials: 'same-origin', cache: 'no-cache' })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const ct = resp.headers.get('content-type') || '';
+        if (!/javascript|ecmascript/i.test(ct)) {
+          throw new Error('bad content-type: ' + ct);
         }
-        if (id === activeId) urlInput.value = finalURL;
-      }
-      var dt = frame.contentDocument && frame.contentDocument.title;
-      if (dt && dt.trim()){
-        /* preserve the "Clone · <uuid>" title we set when opening clones */
-        if (!(tab.title && tab.title.indexOf('Clone · ') === 0)){
-          tab.title = dt.trim().slice(0, 60);
-          if (id === activeId) document.title = tab.title + ' · Lynk';
-        }
-      }
-    } catch(e){}
-    markTabIdle(tab);
-    renderTabs(); updateNavState(); saveTabs();
-    if (id === activeId) applyFrameLayout();
-  });
-  frame.addEventListener('error', function(){
-    tab.error = true;
-    markTabIdle(tab);
-    if (id === activeId) setStatus('err', 'Error');
-  });
+        return resp.text();
+      })
+      .then(function (src) {
+        /* Execute the chunk exactly as a <script> would, but tagged so
+           we know it has already been loaded. */
+        const el = document.createElement('script');
+        el.type = 'text/javascript';
+        el.dataset.lynkLoaded = '1';
+        el.textContent = src;
+        document.head.appendChild(el);
 
-  if (url) markTabBusy(tab);
-  if (emptyEl) emptyEl.style.display = 'none';
-  activateTab(id);
-  renderTabs();
-  saveTabs();
-  return tab;
-}
-
-function activateTab(id){
-  activeId = id;
-  for (var i = 0; i < tabs.length; i++){
-    var t = tabs[i];
-    if (t.frame) t.frame.classList.toggle('active', t.id === id);
-  }
-  var t = activeTab();
-  if (t){
-    urlInput.value = t.url || '';
-    document.title = (t.title || 'Lynk') + ' · Lynk';
-    updateURLLock(t.url);
-    updateURLStar(t.url);
-    setStatus(t.busy ? 'busy' : (t.error ? 'err' : ''),
-              t.busy ? 'Loading…' : (t.error ? 'Error' : 'Ready'));
-  } else {
-    urlInput.value = '';
-    updateURLLock('');
-  }
-  applyFrameLayout();
-  renderTabs(); updateNavState(); renderConsole();
-  saveTabs();
-}
-
-function closeTab(id, opts){
-  opts = opts || {};
-  var i = -1;
-  for (var k = 0; k < tabs.length; k++) if (tabs[k].id === id){ i = k; break; }
-  if (i < 0) return;
-  var t = tabs[i];
-  if (!opts.silent) lastClosed = { url: t.url, title: t.title };
-  clearTimeout(t._watchdog);
-  if (t.frame) t.frame.remove();
-  if (t.busy){ t.busy = false; loadingCount = Math.max(0, loadingCount - 1); }
-  if (consoleBuffers[id]){
-    consoleTotalCount -= consoleBuffers[id].length;
-    delete consoleBuffers[id];
-  }
-  tabs.splice(i, 1);
-  if (activeId === id){
-    if (tabs.length) activateTab(tabs[Math.min(i, tabs.length - 1)].id);
-    else {
-      activeId = null;
-      if (emptyEl) emptyEl.style.display = 'flex';
-      urlInput.value = '';
-      document.title = 'Lynk · Browser';
-      setStatus('', 'Ready');
-      updateURLLock('');
-    }
-  }
-  if (loadingCount === 0) progressComplete();
-  renderTabs(); updateNavState(); renderConsole(); saveTabs();
-}
-
-function duplicateTab(id){
-  var t = tabById(id);
-  if (t) addTab(t.url, { title: t.title });
-}
-function reopenLast(){
-  if (!lastClosed) return;
-  var r = lastClosed; lastClosed = null;
-  addTab(r.url, { title: r.title });
-}
-function navigateCurrent(url, push){
-  if (!activeId){ addTab(url); return; }
-  var t = activeTab(); if (!t) return;
-  if (push){
-    t.history = t.history.slice(0, t.hpos + 1);
-    t.history.push(url);
-    t.hpos = t.history.length - 1;
-  }
-  t.url = url;
-  t.title = url.replace(/^https?:\/\//,'').slice(0, 60);
-  t.error = false;
-  markTabBusy(t);
-  /* KEY FIX: same rule here — local routes are loaded directly. */
-  if (t.frame) t.frame.src = isLocalURL(url) ? fullURL(url) : proxyURL(url);
-  urlInput.value = url;
-  updateURLLock(url);
-  updateURLStar(url);
-  if (emptyEl) emptyEl.style.display = 'none';
-  renderTabs(); updateNavState();
-  sendControlPlane('nav', { url: url, tab_id: t.id });
-  saveTabs();
-}
-function reloadActive(){
-  var t = activeTab();
-  if (!t || !t.frame) return;
-  markTabBusy(t);
-  try {
-    /* Rebuild src from tab.url so clone tabs stay on /clone/<uuid>. */
-    t.frame.src = isLocalURL(t.url) ? fullURL(t.url) : proxyURL(t.url);
-  } catch(e){}
-}
-function stopActive(){
-  var t = activeTab();
-  if (!t || !t.busy) return;
-  try { if (t.frame && t.frame.contentWindow) t.frame.contentWindow.stop(); }
-  catch(e){ try { t.frame.src = 'about:blank'; } catch(e2){} }
-  markTabIdle(t);
-}
-
-/* ============================================================
-   Tab strip
-   ============================================================ */
-function renderTabs(){
-  tabList.innerHTML = '';
-  for (var i = 0; i < tabs.length; i++){
-    var t = tabs[i];
-    var el = document.createElement('div');
-    el.className = 'tab'
-      + (t.id === activeId ? ' active' : '')
-      + (t.busy ? ' busy' : '')
-      + (t.error ? ' err' : '');
-    el.dataset.tabId = t.id;
-    el.title = t.url;
-    el.setAttribute('role', 'tab');
-    el.setAttribute('aria-selected', t.id === activeId ? 'true' : 'false');
-    el.tabIndex = t.id === activeId ? 0 : -1;
-
-    var title = document.createElement('span');
-    title.className = 't-title';
-    title.textContent = (t.title || 'New tab').slice(0, 32);
-    el.appendChild(title);
-
-    var closeEl = document.createElement('span');
-    closeEl.className = 't-close'; closeEl.textContent = '×';
-    closeEl.setAttribute('role', 'button');
-    closeEl.setAttribute('aria-label', 'Close tab');
-    closeEl.addEventListener('click', function(e){
-      e.preventDefault(); e.stopPropagation();
-      var tid = e.currentTarget.parentNode.dataset.tabId;
-      closeTab(tid);
-    });
-    ['mousedown','mouseup','auxclick','contextmenu','pointerdown','pointerup']
-      .forEach(function(ev){
-        closeEl.addEventListener(ev, function(e){ e.stopPropagation(); });
+        const mod = window[KNOWN_CHUNKS[name]] || null;
+        chunkCache[name] = mod;
+        return mod;
+      })
+      .catch(function (err) {
+        chunkFailed[name] = true;
+        /* Only warn once — this is the line that used to spam the console. */
+        console.warn('[lynk] chunk not available:', url, err && err.message);
+        return null;
       });
-    el.appendChild(closeEl);
-
-    el.addEventListener('click', function(e){
-      if (e.target === closeEl) return;
-      activateTab(e.currentTarget.dataset.tabId);
-    });
-    el.addEventListener('auxclick', function(e){
-      if (e.button === 1){ e.preventDefault(); closeTab(e.currentTarget.dataset.tabId); }
-    });
-    el.addEventListener('contextmenu', function(e){
-      e.preventDefault();
-      openCtx(e.clientX, e.clientY, e.currentTarget.dataset.tabId);
-    });
-    el.draggable = true;
-    el.addEventListener('dragstart', function(e){
-      e.dataTransfer.setData('text/lynk-tab', e.currentTarget.dataset.tabId);
-      e.dataTransfer.effectAllowed = 'move';
-      e.currentTarget.style.opacity = '0.5';
-    });
-    el.addEventListener('dragend', function(e){
-      e.currentTarget.style.opacity = '';
-    });
-    el.addEventListener('dragover', function(e){
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-    });
-    el.addEventListener('drop', function(e){
-      e.preventDefault();
-      var srcId = e.dataTransfer.getData('text/lynk-tab');
-      var dstId = e.currentTarget.dataset.tabId;
-      if (!srcId || srcId === dstId) return;
-      var si = -1, di = -1;
-      for (var k = 0; k < tabs.length; k++){
-        if (tabs[k].id === srcId) si = k;
-        if (tabs[k].id === dstId) di = k;
-      }
-      if (si < 0 || di < 0) return;
-      var moved = tabs.splice(si, 1)[0];
-      tabs.splice(di, 0, moved);
-      renderTabs(); saveTabs();
-    });
-    tabList.appendChild(el);
   }
-  stTabs.textContent = tabs.length + ' tab' + (tabs.length === 1 ? '' : 's');
-}
 
-/* ============================================================
-   URL bar
-   ============================================================ */
-function updateURLLock(url){
-  if (isSecure(url)){
-    urlLock.textContent = '🔒';
-    urlLock.classList.add('secure');
-    urlLock.style.color = '';
-  } else if (/^http:/i.test(url)){
-    urlLock.textContent = '⚠';
-    urlLock.classList.remove('secure');
-    urlLock.style.color = 'var(--warn)';
-  } else {
-    urlLock.textContent = '⌕';
-    urlLock.classList.remove('secure');
-    urlLock.style.color = '';
+  function preloadChunks(names) {
+    return Promise.all((names || []).map(function (n) { return loadChunk(n); }));
   }
-}
-function loadBookmarks(){
-  try { return JSON.parse(localStorage.getItem(BOOKMARK_KEY) || '[]'); }
-  catch(e){ return []; }
-}
-function saveBookmarks(b){ try { localStorage.setItem(BOOKMARK_KEY, JSON.stringify(b)); } catch(e){} }
-function isBookmarked(u){ return loadBookmarks().some(function(b){ return b.url === u; }); }
-function updateURLStar(url){
-  var on = isBookmarked(url);
-  urlStar.classList.toggle('on', on);
-  urlStar.textContent = on ? '★' : '☆';
-}
-function go(){
-  var v = urlInput.value.trim(); if (!v) return;
-  var looksURL = /^https?:\/\//i.test(v) ||
-                 (/^[\w\-]+(\.[\w\-]+)+/.test(v) && !/\s/.test(v));
-  var target = looksURL ? (/^https?:\/\//i.test(v) ? v : 'https://' + v)
-                        : '/search?q=' + encodeURIComponent(v) + '&engine=duckduckgo';
-  navigateCurrent(target, true);
-}
-btnGo.onclick = go;
-urlInput.addEventListener('keydown', function(e){
-  if (e.key === 'Enter'){ e.preventDefault(); go(); }
-});
-urlInput.addEventListener('focus', function(){ urlInput.select(); });
-btnBack.onclick = function(){
-  var t = activeTab(); if (!t || t.hpos <= 0) return;
-  t.hpos--; navigateCurrent(t.history[t.hpos], false);
-};
-btnFwd.onclick = function(){
-  var t = activeTab(); if (!t || t.hpos >= t.history.length - 1) return;
-  t.hpos++; navigateCurrent(t.history[t.hpos], false);
-};
-btnReload.onclick = function(){
-  var t = activeTab();
-  if (t && t.busy) stopActive();
-  else reloadActive();
-};
-urlStar.onclick = function(){
-  var t = activeTab(); if (!t || !t.url){ showToast('Nothing to bookmark'); return; }
-  var b = loadBookmarks();
-  if (isBookmarked(t.url)){
-    b = b.filter(function(x){ return x.url !== t.url; });
-    showToast('Bookmark removed');
-  } else {
-    b.push({ url: t.url, title: t.title });
-    showToast('Bookmarked');
-  }
-  saveBookmarks(b); updateURLStar(t.url);
-};
-if (urlCopy){
-  urlCopy.onclick = copyActiveURL;
-}
-document.getElementById('newTab').onclick = function(){ addTab('https://duckduckgo.com'); };
 
-/* ============================================================
-   Zoom + desktop controls wiring
-   ============================================================ */
-document.getElementById('zoomIn').onclick = function(){
-  setZoom(getZoom() + 0.1);
-};
-document.getElementById('zoomOut').onclick = function(){
-  setZoom(getZoom() - 0.1);
-};
-if (zoomLevelEl){
-  zoomLevelEl.onclick = function(){
-    setZoom(1);
+  /* =================== TAB STATE =================== */
+
+  const tabs = [];              /* { id, title, url, upstream, iframe, active } */
+  let activeTabId = null;
+  let nextTabId   = 1;
+
+  function newTabId() { return 'tab-' + (nextTabId++); }
+
+  function findTab(id) {
+    for (let i = 0; i < tabs.length; i++) if (tabs[i].id === id) return tabs[i];
+    return null;
+  }
+
+  function activeTab() { return findTab(activeTabId); }
+
+  /* =================== DOM (built lazily) =================== */
+
+  const ui = {
+    root:       null,
+    tabStrip:   null,
+    tabList:    null,
+    urlBar:     null,
+    back:       null,
+    forward:    null,
+    reload:     null,
+    newTabBtn:  null,
+    container:  null,
   };
-}
-if (desktopToggleEl){
-  setDesktopModeRaw(getDesktopMode());
-  desktopToggleEl.onclick = function(){
-    var on = !getDesktopMode();
-    setDesktopModeRaw(on);
-    applyFrameLayout();
-    showToast(on ? 'Desktop view' : 'Mobile view');
-  };
-}
-updateZoomDisplay();
 
-function scheduleLayout(){
-  clearTimeout(_layoutTimer);
-  _layoutTimer = setTimeout(applyFrameLayout, 150);
-}
-window.addEventListener('resize', scheduleLayout);
-window.addEventListener('orientationchange', function(){
-  setTimeout(applyFrameLayout, 250);
-});
+  function ensureUI() {
+    if (ui.root) return;
+    ui.root = document.createElement('div');
+    ui.root.id = 'lynk-shell';
+    ui.root.innerHTML = '\
+      <div class="lynk-tabstrip" data-tabstrip>\
+        <div class="lynk-tabs" data-tabs></div>\
+        <button class="lynk-newtab" data-newtab title="New tab">+</button>\
+      </div>\
+      <div class="lynk-urlbar">\
+        <button data-back    title="Back">‹</button>\
+        <button data-forward title="Forward">›</button>\
+        <button data-reload  title="Reload">⟳</button>\
+        <input  data-url type="text" spellcheck="false" placeholder="Enter URL"/>\
+      </div>\
+      <div class="lynk-viewport" data-container></div>\
+    ';
+    document.body.appendChild(ui.root);
 
-/* ============================================================
-   Console
-   ============================================================ */
-function addConsole(tabId, level, text, src){
-  var buf = consoleBuffers[tabId] || (consoleBuffers[tabId] = []);
-  buf.push({
-    id: ++consoleSeq, tabId: tabId, time: Date.now(),
-    level: level, text: String(text||''), src: String(src||''),
+    ui.tabStrip  = ui.root.querySelector('[data-tabstrip]');
+    ui.tabList   = ui.root.querySelector('[data-tabs]');
+    ui.urlBar    = ui.root.querySelector('[data-url]');
+    ui.back      = ui.root.querySelector('[data-back]');
+    ui.forward   = ui.root.querySelector('[data-forward]');
+    ui.reload    = ui.root.querySelector('[data-reload]');
+    ui.newTabBtn = ui.root.querySelector('[data-newtab]');
+    ui.container = ui.root.querySelector('[data-container]');
+
+    ui.newTabBtn.addEventListener('click', function () { createTab('about:blank'); });
+    ui.urlBar.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter') return;
+      const v = ui.urlBar.value.trim();
+      if (!v) return;
+      navigateActive(normalizeUserUrl(v));
+    });
+    ui.back.addEventListener('click',    function () { historyBack(); });
+    ui.forward.addEventListener('click', function () { historyForward(); });
+    ui.reload.addEventListener('click',  function () { reloadActive(); });
+  }
+
+  /* =================== URL HELPERS =================== */
+
+  function normalizeUserUrl(raw) {
+    if (!raw) return 'about:blank';
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return raw;
+    if (/^[\w-]+(\.[\w-]+)+/.test(raw)) return 'https://' + raw;
+    /* search query */
+    return 'https://duckduckgo.com/?q=' + encodeURIComponent(raw);
+  }
+
+  function proxyUrlFor(upstreamUrl) {
+    if (!upstreamUrl || upstreamUrl === 'about:blank') return upstreamUrl;
+    return ORIGIN + '/proxy?url=' + encodeURIComponent(upstreamUrl);
+  }
+
+  /* =================== TAB LIFECYCLE =================== */
+
+  function createTab(url) {
+    ensureUI();
+    const id = newTabId();
+    const upstream = (function () {
+      try { return new URL(url).origin; } catch (e) { return null; }
+    })();
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'lynk-frame';
+    iframe.setAttribute('allow', 'clipboard-read; clipboard-write; fullscreen; camera; microphone');
+    iframe.setAttribute('sandbox', 'allow-forms allow-scripts allow-same-origin allow-popups allow-modals allow-downloads allow-storage-access-by-user-activation allow-popups-to-escape-sandbox');
+
+    const record = {
+      id, url, upstream, iframe, title: '', active: false,
+      history: [url], historyIndex: 0,
+    };
+    tabs.push(record);
+    ui.container.appendChild(iframe);
+
+    /* Ensure ui.js and toolkit.js are available on first tab. */
+    preloadChunks(['ui.js', 'toolkit.js']).catch(function () {});
+
+    iframe.src = proxyUrlFor(url);
+    iframe.addEventListener('load', function () {
+      try {
+        record.title = iframe.contentDocument.title || record.title;
+      } catch (e) {}
+      renderTabs();
+    });
+
+    setActiveTab(id);
+    return record;
+  }
+
+  function setActiveTab(id) {
+    const target = findTab(id);
+    if (!target) return;
+    activeTabId = id;
+    tabs.forEach(function (t) {
+      t.active = t.id === id;
+      t.iframe.style.display = t.active ? 'block' : 'none';
+    });
+    ui.urlBar.value = target.url;
+    renderTabs();
+  }
+
+  function closeTab(id) {
+    const idx = tabs.findIndex(function (t) { return t.id === id; });
+    if (idx < 0) return;
+    const t = tabs[idx];
+    try { t.iframe.remove(); } catch (e) {}
+    tabs.splice(idx, 1);
+    if (activeTabId === id) {
+      const next = tabs[idx] || tabs[idx - 1];
+      if (next) setActiveTab(next.id);
+      else { activeTabId = null; createTab('about:blank'); }
+    }
+    renderTabs();
+  }
+
+  function navigateActive(upstreamUrl, opts) {
+    const t = activeTab();
+    if (!t) { createTab(upstreamUrl); return; }
+    const push = !(opts && opts.replace);
+    if (push) {
+      t.history = t.history.slice(0, t.historyIndex + 1);
+      t.history.push(upstreamUrl);
+      t.historyIndex = t.history.length - 1;
+    } else {
+      t.history[t.historyIndex] = upstreamUrl;
+    }
+    t.url = upstreamUrl;
+    try { t.upstream = new URL(upstreamUrl).origin; } catch (e) {}
+    t.iframe.src = proxyUrlFor(upstreamUrl);
+    ui.urlBar.value = upstreamUrl;
+    renderTabs();
+  }
+
+  function historyBack() {
+    const t = activeTab(); if (!t) return;
+    if (t.historyIndex <= 0) return;
+    t.historyIndex--;
+    t.url = t.history[t.historyIndex];
+    t.iframe.src = proxyUrlFor(t.url);
+    ui.urlBar.value = t.url;
+  }
+  function historyForward() {
+    const t = activeTab(); if (!t) return;
+    if (t.historyIndex >= t.history.length - 1) return;
+    t.historyIndex++;
+    t.url = t.history[t.historyIndex];
+    t.iframe.src = proxyUrlFor(t.url);
+    ui.urlBar.value = t.url;
+  }
+  function reloadActive() {
+    const t = activeTab(); if (!t) return;
+    t.iframe.src = proxyUrlFor(t.url);
+  }
+
+  /* =================== TAB STRIP RENDERING =================== */
+
+  function renderTabs() {
+    if (!ui.tabList) return;
+    ui.tabList.innerHTML = '';
+    tabs.forEach(function (t) {
+      const el = document.createElement('div');
+      el.className = 'lynk-tab' + (t.active ? ' active' : '');
+      el.dataset.tabId = t.id;
+      const label = document.createElement('span');
+      label.className = 'lynk-tab-title';
+      label.textContent = (t.title || t.url || 'New tab').slice(0, 40);
+      const close = document.createElement('button');
+      close.className = 'lynk-tab-close';
+      close.textContent = '×';
+      close.addEventListener('click', function (e) {
+        e.stopPropagation();
+        closeTab(t.id);
+      });
+      el.addEventListener('click', function () { setActiveTab(t.id); });
+      el.appendChild(label);
+      el.appendChild(close);
+      ui.tabList.appendChild(el);
+    });
+  }
+
+  /* =================== INTERCEPTOR BRIDGE =================== */
+
+  window.addEventListener('message', function (e) {
+    const d = e.data;
+    if (!d || typeof d.type !== 'string') return;
+    if (d.type.indexOf('lynk:') !== 0) return;
+
+    const t = tabs.find(function (x) { return x.iframe && x.iframe.contentWindow === e.source; });
+    switch (d.type) {
+      case 'lynk:nav-start':
+        if (t) {
+          if (d.target) {
+            t.url = d.target;
+            t.history = t.history.slice(0, t.historyIndex + 1);
+            t.history.push(d.target);
+            t.historyIndex = t.history.length - 1;
+            ui.urlBar.value = d.target;
+          }
+        }
+        break;
+      case 'lynk:nav-loaded':
+        if (t) {
+          if (d.title) t.title = d.title;
+          if (d.url) t.url = d.url;
+          renderTabs();
+        }
+        break;
+      case 'lynk:push-state':
+        if (t && d.upstreamUrl) {
+          t.url = d.upstreamUrl;
+          t.history = t.history.slice(0, t.historyIndex + 1);
+          t.history.push(d.upstreamUrl);
+          t.historyIndex = t.history.length - 1;
+          ui.urlBar.value = d.upstreamUrl;
+        }
+        break;
+      case 'lynk:console':
+      case 'lynk:error':
+      case 'lynk:network':
+        /* forward to devtools-style log sink */
+        try { console.debug('[lynk-bridge]', d.type, d); } catch (err) {}
+        break;
+      case 'lynk:capture':
+        handleCaptureRequest(d, t);
+        break;
+      case 'lynk:clone-edit':
+        broadcastCloneEdit(d);
+        break;
+      case 'lynk:clone-edit-done':
+        /* broadcast to other shells via WS */
+        serviceSend({ type: 'clone-edit-done', payload: d });
+        break;
+    }
   });
-  consoleTotalCount++;
-  if (buf.length > CONSOLE_MAX){
-    var drop = buf.length - CONSOLE_MAX;
-    buf.splice(0, drop);
-    consoleTotalCount -= drop;
-  }
-  while (consoleTotalCount > CONSOLE_TOTAL){
-    var oldestKey = null, oldestTime = Infinity;
-    for (var k in consoleBuffers){
-      var b = consoleBuffers[k];
-      if (b.length && b[0].time < oldestTime){
-        oldestTime = b[0].time; oldestKey = k;
-      }
-    }
-    if (!oldestKey) break;
-    consoleBuffers[oldestKey].shift();
-    consoleTotalCount--;
-  }
-  if (tabId === activeId || !consoleOnlyActive) renderConsole();
-  updateConsoleBadge();
-  sendControlPlane('console', {
-    tab_id: tabId, level: level, text: text, src: src,
-  });
-}
-function visibleConsoleEntries(){
-  var all = [];
-  for (var k in consoleBuffers){
-    var b = consoleBuffers[k] || [];
-    for (var i = 0; i < b.length; i++) all.push(b[i]);
-  }
-  if (consoleOnlyActive && activeId) {
-    all = all.filter(function(e){ return e.tabId === activeId; });
-  }
-  if (consoleFilter !== 'all'){
-    if (consoleFilter === 'net') all = all.filter(function(e){ return e.level === 'net'; });
-    else                          all = all.filter(function(e){ return e.level === consoleFilter; });
-  }
-  all.sort(function(a,b){ return a.time - b.time; });
-  return all;
-}
-function renderConsole(){
-  var entries = visibleConsoleEntries();
-  if (!entries.length){
-    consoleList.innerHTML = '<div style="padding:40px 20px;text-align:center;color:#64748b">'
-      + 'No messages' + (consoleFilter !== 'all' ? ' for this filter' : '') + '.</div>';
-    return;
-  }
-  var slice = entries.slice(-500);
-  consoleList.innerHTML = slice.map(function(e){
-    var t  = new Date(e.time);
-    var hh = String(t.getHours()).padStart(2,'0');
-    var mm = String(t.getMinutes()).padStart(2,'0');
-    var ss = String(t.getSeconds()).padStart(2,'0');
-    var lvl = e.level === 'net' ? 'NET' : e.level.toUpperCase().slice(0,5);
-    return '<div class="console-row ' + escHtml(e.level) + '">'
-      + '<span class="time">' + hh + ':' + mm + ':' + ss + '</span>'
-      + '<span class="lvl">' + lvl + '</span>'
-      + '<div class="msg">' + escHtml(e.text)
-      + (e.src ? '<div class="src">' + escHtml(e.src) + '</div>' : '')
-      + '</div></div>';
-  }).join('');
-  if (consoleAutoScroll) consoleList.scrollTop = consoleList.scrollHeight;
-}
-consoleList.addEventListener('scroll', function(){
-  var nearBottom = consoleList.scrollHeight - consoleList.scrollTop - consoleList.clientHeight < 40;
-  consoleAutoScroll = nearBottom;
-});
-function updateConsoleBadge(){
-  consoleTotal.textContent = '(' + consoleTotalCount + ')';
-}
-document.querySelectorAll('.console-filter').forEach(function(b){
-  b.onclick = function(){
-    document.querySelectorAll('.console-filter').forEach(function(x){ x.classList.remove('active'); });
-    b.classList.add('active');
-    consoleFilter = b.dataset.lvl;
-    renderConsole();
-  };
-});
-document.getElementById('consoleActiveTab').onchange = function(e){
-  consoleOnlyActive = e.target.checked;
-  renderConsole();
-};
-document.getElementById('consoleClear').onclick = function(){
-  if (!confirm('Clear console output?')) return;
-  consoleBuffers = Object.create(null);
-  consoleTotalCount = 0;
-  renderConsole(); updateConsoleBadge();
-};
-document.getElementById('consoleExport').onclick = function(){
-  var all = visibleConsoleEntries();
-  var txt = all.map(function(e){
-    var t = tabById(e.tabId);
-    return '[' + new Date(e.time).toISOString() + '] ['
-      + e.level.toUpperCase() + '] [' + (t ? t.title : 'closed') + '] '
-      + e.text + (e.src ? '\n  at ' + e.src : '');
-  }).join('\n');
-  dl('lynk_console.txt', txt);
-};
-document.getElementById('consoleClose').onclick = function(){
-  drawerConsole.classList.remove('open');
-};
 
-/* ============================================================
-   iframe ↔ shell
-   ============================================================ */
-window.addEventListener('message', function(e){
-  var m = e.data;
-  if (!m || typeof m !== 'object') return;
-  var type = String(m.type || '');
-  if (type.indexOf('lynk:') !== 0) return;
-  var tab = findTabByWindow(e.source);
-  if (!tab) return;
+  /* =================== CAPTURE / CLONE =================== */
 
-  if (type === 'lynk:nav-start'){
-    markTabBusy(tab);
-  } else if (type === 'lynk:nav-loaded'){
-    var real = realURLFromProxied(m.url);
-    if (real){
-      tab.url = real;
-      if (tab.history[tab.hpos] !== real){
-        tab.history = tab.history.slice(0, tab.hpos + 1);
-        tab.history.push(real);
-        tab.hpos = tab.history.length - 1;
-      }
-      if (tab.id === activeId){
-        urlInput.value = real;
-        updateURLLock(real);
-        updateURLStar(real);
-      }
-    }
-    if (m.title && !(tab.title && tab.title.indexOf('Clone · ') === 0)) {
-      tab.title = String(m.title).slice(0,60);
-    }
-    markTabIdle(tab);
-    renderTabs(); updateNavState(); saveTabs();
-  } else if (type === 'lynk:push-state'){
-    if (m.upstreamUrl){
-      tab.url = m.upstreamUrl;
-      if (tab.history[tab.hpos] !== m.upstreamUrl){
-        tab.history = tab.history.slice(0, tab.hpos + 1);
-        tab.history.push(m.upstreamUrl);
-        tab.hpos = tab.history.length - 1;
-      }
-      if (tab.id === activeId) urlInput.value = m.upstreamUrl;
-      updateNavState(); renderTabs(); saveTabs();
-    }
-  } else if (type === 'lynk:console'){
-    addConsole(tab.id, String(m.level || 'log'),
-               (m.args || []).join(' '), m.src || '');
-  } else if (type === 'lynk:error'){
-    addConsole(tab.id, 'error',
-               (m.message || '') + (m.stack ? '\n' + m.stack : ''),
-               m.source || '');
-    tab.error = true; renderTabs();
-  } else if (type === 'lynk:network'){
-    addConsole(tab.id, 'net',
-               (m.method || 'GET') + ' ' + (m.url || '') + ' → '
-                 + (m.status || m.error || '?'), '');
+  function handleCaptureRequest(d, tab) {
+    /* The interceptor already collected the payload; just forward it
+       to the server-side cloner. */
+    fetch('/cloner/capture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(d.payload || {}),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (tab && tab.iframe && tab.iframe.contentWindow) {
+          tab.iframe.contentWindow.postMessage({
+            type: 'lynk:capture-done', result: res,
+          }, '*');
+        }
+      })
+      .catch(function (err) {
+        if (tab && tab.iframe && tab.iframe.contentWindow) {
+          tab.iframe.contentWindow.postMessage({
+            type: 'lynk:capture-error', error: String(err),
+          }, '*');
+        }
+      });
   }
-});
 
-/* ============================================================
-   Context menu
-   ============================================================ */
-var ctxTabId = null;
-function openCtx(x, y, tabId){
-  var t = tabById(tabId); if (!t) return;
-  ctxTabId = tabId;
-  var idx = -1;
-  for (var i = 0; i < tabs.length; i++) if (tabs[i].id === tabId){ idx = i; break; }
-  var hasRight  = idx < tabs.length - 1;
-  var hasOthers = tabs.length > 1;
-  ctxMenu.innerHTML = '';
-  function mk(icon, label, h, sc, danger, disabled){
-    var el = document.createElement('div');
-    el.className = 'ctx-item' + (danger ? ' danger' : '');
-    if (disabled) el.style.opacity = '.4';
-    el.innerHTML = '<span style="width:14px;text-align:center;color:#64748b">'+icon+'</span>'
-      + '<span>' + label + '</span>'
-      + (sc ? '<span class="shortcut">' + sc + '</span>' : '');
-    if (!disabled) el.addEventListener('click', function(){ hideCtx(); h(); });
-    return el;
-  }
-  function sep(){ var s = document.createElement('div'); s.className = 'ctx-sep'; return s; }
-  ctxMenu.appendChild(mk('↻','Reload', function(){ activateTab(tabId); reloadActive(); }, 'Ctrl+R'));
-  ctxMenu.appendChild(mk('⎘','Duplicate', function(){ duplicateTab(tabId); }));
-  ctxMenu.appendChild(mk('⧉','Copy URL', function(){
-    var tt = tabById(tabId);
-    if (!tt || !tt.url) return;
-    copyToClipboard(fullURL(tt.url), 'URL copied');
-  }, 'Ctrl+Shift+C'));
-  ctxMenu.appendChild(sep());
-  ctxMenu.appendChild(mk('✕','Close tab', function(){ closeTab(tabId); }, 'Ctrl+W', true));
-  ctxMenu.appendChild(mk('⊘','Close others', function(){
-    tabs.slice().forEach(function(t2){
-      if (t2.id !== tabId) closeTab(t2.id, {silent:true});
+  function broadcastCloneEdit(d) {
+    tabs.forEach(function (t) {
+      if (t.id === d.clone_id || t.iframe.src.indexOf('/clone/' + d.clone_id) !== -1) {
+        try {
+          t.iframe.contentWindow.postMessage(d, '*');
+        } catch (e) {}
+      }
     });
-  }, null, true, !hasOthers));
-  ctxMenu.appendChild(mk('⇥','Close right', function(){
-    var i = -1;
-    for (var k = 0; k < tabs.length; k++) if (tabs[k].id === tabId) i = k;
-    tabs.slice(i+1).forEach(function(t2){ closeTab(t2.id, {silent:true}); });
-  }, null, true, !hasRight));
-  ctxMenu.appendChild(sep());
-  ctxMenu.appendChild(mk('＋','New tab', function(){ addTab('https://duckduckgo.com'); }, 'Ctrl+T'));
-  ctxMenu.appendChild(mk('↺','Reopen last', reopenLast, 'Ctrl+Shift+T', false, !lastClosed));
-  ctxMenu.classList.add('show');
-  var r = ctxMenu.getBoundingClientRect();
-  var pad = 8;
-  x = clamp(x, pad, window.innerWidth  - r.width  - pad);
-  y = clamp(y, pad, window.innerHeight - r.height - pad);
-  ctxMenu.style.left = x + 'px';
-  ctxMenu.style.top  = y + 'px';
-}
-function hideCtx(){ ctxMenu.classList.remove('show'); ctxTabId = null; }
-document.addEventListener('click', function(e){ if (!ctxMenu.contains(e.target)) hideCtx(); });
-document.addEventListener('keydown', function(e){
-  if (e.key === 'Escape' && ctxMenu.classList.contains('show')) hideCtx();
-});
-
-/* ============================================================
-   Menu bar
-   ============================================================ */
-document.getElementById('mFile').onclick = function(e){
-  e.stopPropagation();
-  var id = activeId || (tabs[0] && tabs[0].id);
-  if (id) openCtx(e.clientX, e.clientY + 4, id);
-};
-document.getElementById('mTools').onclick = function(){ drawerKit.classList.toggle('open'); };
-document.getElementById('mConsole').onclick = function(){ drawerConsole.classList.toggle('open'); };
-document.getElementById('mView').onclick = function(e){
-  e.stopPropagation();
-  ctxMenu.innerHTML = '';
-  var items = [
-    ['Toggle console', function(){ drawerConsole.classList.toggle('open'); }],
-    ['Toggle toolkit', function(){ drawerKit.classList.toggle('open'); }],
-    ['Zoom in',  function(){ setZoom(getZoom() + 0.1); }],
-    ['Zoom out', function(){ setZoom(getZoom() - 0.1); }],
-    ['Reset zoom', function(){ setZoom(1); }],
-    ['Copy current URL', copyActiveURL],
-  ];
-  if (isMobileOnlyViewport()){
-    items.push(['Toggle desktop view', function(){
-      setDesktopModeRaw(!getDesktopMode());
-      applyFrameLayout();
-    }]);
+    serviceSend({ type: 'clone-edit', payload: d });
   }
-  items.forEach(function(it){
-    var el = document.createElement('div');
-    el.className = 'ctx-item';
-    el.textContent = it[0];
-    el.addEventListener('click', function(){ hideCtx(); it[1](); });
-    ctxMenu.appendChild(el);
-  });
-  var r = this.getBoundingClientRect();
-  ctxMenu.classList.add('show');
-  var cr = ctxMenu.getBoundingClientRect();
-  var pad = 8;
-  var x = clamp(r.left, pad, window.innerWidth - cr.width - pad);
-  var y = clamp(r.bottom + 4, pad, window.innerHeight - cr.height - pad);
-  ctxMenu.style.left = x + 'px';
-  ctxMenu.style.top  = y + 'px';
-};
 
-/* Clone button in menu bar */
-var mCloneEl = document.getElementById('mClone');
-if (mCloneEl){
-  mCloneEl.onclick = async function(){
-    var r = await cloneActivePage();
-    if (r && r.uuid) openClone(r.uuid);
-  };
-}
+  /* =================== SERVICE WEBSOCKET =================== */
 
-document.getElementById('kitClose').onclick = function(){ drawerKit.classList.remove('open'); };
+  let serviceWs = null;
+  let serviceReady = false;
 
-/* ============================================================
-   Palette
-   ============================================================ */
-var cmdk   = document.getElementById('cmdk');
-var cmdkIn = document.getElementById('cmdkInput');
-function openCmdk(p){
-  cmdk.classList.add('show');
-  cmdkIn.value = p || '';
-  setTimeout(function(){ cmdkIn.focus(); cmdkIn.select(); }, 40);
-}
-function closeCmdk(){ cmdk.classList.remove('show'); }
-cmdk.onclick = function(e){ if (e.target === cmdk) closeCmdk(); };
-cmdkIn.addEventListener('keydown', function(e){
-  if (e.key === 'Escape') return closeCmdk();
-  if (e.key === 'Enter'){
-    var v = cmdkIn.value.trim(); if (!v) return;
-    var looksURL = /^https?:\/\//i.test(v) || (/^[\w\-]+(\.[\w\-]+)+/.test(v) && !/\s/.test(v));
-    var target = looksURL ? (/^https?:\/\//i.test(v) ? v : 'https://' + v)
-                          : '/search?q=' + encodeURIComponent(v) + '&engine=duckduckgo';
-    if (e.shiftKey) addTab(target); else navigateCurrent(target, true);
-    closeCmdk();
-  }
-});
-
-/* ============================================================
-   Keyboard
-   ============================================================ */
-document.addEventListener('keydown', function(e){
-  var mod = e.ctrlKey || e.metaKey;
-  if (!mod){
-    if (e.key === 'Escape'){
-      if (cmdk.classList.contains('show')) closeCmdk();
-      var t = activeTab();
-      if (t && t.busy) stopActive();
-    }
-    return;
-  }
-  var k = (e.key || '').toLowerCase();
-  if (k === 'k'){ e.preventDefault(); openCmdk(); }
-  else if (k === 'l'){ e.preventDefault(); urlInput.focus(); urlInput.select(); }
-  else if (k === 'b'){ e.preventDefault(); drawerKit.classList.toggle('open'); }
-  else if (k === '`' || k === '~'){ e.preventDefault(); drawerConsole.classList.toggle('open'); }
-  else if (k === 'd'){ e.preventDefault(); urlStar.click(); }
-  else if (k === 'c' && e.shiftKey){ e.preventDefault(); copyActiveURL(); }
-  else if (k === 't' && !e.shiftKey){ e.preventDefault(); addTab('https://duckduckgo.com'); }
-  else if (k === 't' && e.shiftKey){ e.preventDefault(); reopenLast(); }
-  else if (k === 'w'){ e.preventDefault(); if (activeId) closeTab(activeId); }
-  else if (k === 'r'){ e.preventDefault(); reloadActive(); }
-  else if (k === '=' || k === '+'){ e.preventDefault(); setZoom(getZoom() + 0.1); }
-  else if (k === '-'){ e.preventDefault(); setZoom(getZoom() - 0.1); }
-  else if (k === '0'){ e.preventDefault(); setZoom(1); }
-  else if (k === 'tab'){
-    e.preventDefault();
-    if (!tabs.length) return;
-    var i = -1;
-    for (var x = 0; x < tabs.length; x++) if (tabs[x].id === activeId) i = x;
-    if (i < 0) i = 0;
-    var n = e.shiftKey ? (i-1+tabs.length)%tabs.length : (i+1)%tabs.length;
-    activateTab(tabs[n].id);
-  }
-  else if (/^[1-9]$/.test(k) && !e.shiftKey){
-    e.preventDefault(); var idx = parseInt(k,10)-1;
-    if (idx < tabs.length) activateTab(tabs[idx].id);
-  }
-});
-
-/* ============================================================
-   Status bar hover
-   ============================================================ */
-var lastMove = 0;
-document.addEventListener('mousemove', function(e){
-  var now = Date.now();
-  if (now - lastMove < 80) return;
-  lastMove = now;
-  var el = e.target;
-  if (!el || !el.closest) return;
-  var a = el.closest('a[href]');
-  if (a && a.href) stLink.textContent = a.href;
-  else if (el.closest('.tab')){
-    var t = tabById(el.closest('.tab').dataset.tabId);
-    stLink.textContent = t ? t.url : '';
-  } else stLink.textContent = '';
-});
-
-/* ============================================================
-   Control plane (lynkio WebSocket)
-   ============================================================ */
-var lynk = null;
-var lynkReady = false;
-var lynkOutbound = [];
-
-function connectLynk(){
-  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  var url = proto + '//' + location.host + '/__lynk_ws';
-  try {
-    if (typeof LynkClient === 'undefined'){
-      if (wsBadge) { wsBadge.textContent = '· WS n/a'; wsBadge.style.color = '#64748b'; }
+  function serviceConnect() {
+    try {
+      serviceWs = new WebSocket(SERVICE_WS);
+    } catch (e) {
+      setTimeout(serviceConnect, 3000);
       return;
     }
-    lynk = new LynkClient(url, {}, { maxReconnectAttempts: 100, reconnectDelay: 1200 });
-    lynk.on('subscribed', function(){
-      lynkReady = true;
-      if (wsBadge){ wsBadge.textContent = '· WS ●'; wsBadge.style.color = '#10b981'; }
-      while (lynkOutbound.length){
-        var msg = lynkOutbound.shift();
-        try { lynk.emit(msg.event, msg.data); } catch(e){}
+    serviceWs.addEventListener('open',  function () { serviceReady = true; });
+    serviceWs.addEventListener('close', function () {
+      serviceReady = false;
+      setTimeout(serviceConnect, 3000);
+    });
+    serviceWs.addEventListener('message', function (ev) {
+      let msg = null;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (!msg || !msg.type) return;
+      if (msg.type === 'clone-edit') {
+        broadcastCloneEdit(msg.payload);
       }
     });
-    lynk.on('console', function(data){
-      addConsole(data.tab_id || '__remote', data.level || 'log',
-                 data.text || '', data.src || '');
-    });
-    lynk.on('nav', function(data){
-      if (!stMeta) return;
-      stMeta.textContent = 'peer nav: ' + String(data.url || '').slice(0, 60);
-      setTimeout(function(){ stMeta.textContent = ''; }, 2200);
-    });
-    lynk.on('progress', function(){});
-    lynk.on('pong', function(){});
-    lynk.connect().then(function(){
-      lynk.emit('subscribe', {
-        tabs: tabs.map(function(t){ return t.id; }),
-        version: 'v18.3',
-      });
-    }).catch(function(){
-      if (wsBadge){ wsBadge.textContent = '· WS ⚠'; wsBadge.style.color = '#f87171'; }
-    });
-  } catch(e){
-    if (wsBadge){ wsBadge.textContent = '· WS ⚠'; wsBadge.style.color = '#f87171'; }
   }
-}
-function sendControlPlane(event, data){
-  if (lynkReady && lynk){
-    try { lynk.emit(event, data); return; } catch(e){}
+
+  function serviceSend(obj) {
+    if (!serviceReady) return;
+    try { serviceWs.send(JSON.stringify(obj)); } catch (e) {}
   }
-  lynkOutbound.push({ event: event, data: data });
-  if (lynkOutbound.length > 200) lynkOutbound.splice(0, lynkOutbound.length - 200);
-}
 
-/* ============================================================
-   Persistence
-   ============================================================ */
-function saveTabs(){
-  try {
-    var payload = {
-      activeId: activeId,
-      tabs: tabs.map(function(t){
-        return { url: t.url, title: t.title, hpos: t.hpos, history: t.history };
-      })
-    };
-    localStorage.setItem(TABS_KEY, JSON.stringify(payload));
-  } catch(e){}
-}
-function restoreTabs(){
-  var raw = null;
-  try { raw = JSON.parse(localStorage.getItem(TABS_KEY) || 'null'); } catch(e){}
-  if (!raw || !raw.tabs || !raw.tabs.length) return false;
-  try {
-    raw.tabs.forEach(function(t){
-      var tab = addTab(t.url, { title: t.title });
-      if (Array.isArray(t.history) && t.history.length){
-        tab.history = t.history.slice();
-        tab.hpos = Math.min(t.hpos || 0, tab.history.length - 1);
-      }
-    });
-    return tabs.length > 0;
-  } catch(e){
-    return false;
+  /* =================== KEYBOARD =================== */
+
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 't') {
+      e.preventDefault(); createTab('about:blank');
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'w') {
+      e.preventDefault();
+      if (activeTabId) closeTab(activeTabId);
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') {
+      e.preventDefault();
+      if (ui.urlBar) { ui.urlBar.focus(); ui.urlBar.select(); }
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r') {
+      e.preventDefault(); reloadActive();
+    } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'e') {
+      e.preventDefault();
+      const t = activeTab(); if (!t) return;
+      try { t.iframe.contentWindow.postMessage({ type: 'lynk:editor-toggle' }, '*'); } catch (er) {}
+    }
+  });
+
+  /* =================== BOOT =================== */
+
+  function boot() {
+    ensureUI();
+    preloadChunks(['ui.js', 'toolkit.js']).catch(function () {});
+    serviceConnect();
+    if (tabs.length === 0) createTab('about:blank');
   }
-}
 
-/* ============================================================
-   Public API — consumed by toolkit.js
-   ============================================================ */
-window.__LYNK__ = {
-  tabs:            function(){ return tabs; },
-  activeTab:       activeTab,
-  activeTabUrl:    activeTabURL,
-  activeTabHost:   activeTabHost,
-  activeTabOrigin: activeTabOrigin,
-  getIframeDoc:    getIframeDoc,
-  addTab:          addTab,
-  activateTab:     activateTab,
-  closeTab:        closeTab,
-  navigate:        navigateCurrent,
-  reload:          reloadActive,
-  toast:           showToast,
-  download:        dl,
-  escHtml:         escHtml,
-  openConsole:     function(){ drawerConsole.classList.add('open'); },
-  openKit:         function(){ drawerKit.classList.add('open'); },
-  kitBody:         document.getElementById('kitBody'),
-  addConsole:      addConsole,
-  setStatus:       setStatus,
-  emit:            sendControlPlane,
-  startProgress:   progressStart,
-  completeProgress: progressComplete,
-  lynk:            function(){ return lynk; },
-  setZoom:         setZoom,
-  getZoom:         getZoom,
-  setDesktopMode:  function(on){ setDesktopModeRaw(!!on); applyFrameLayout(); },
-  getDesktopMode:  getDesktopMode,
-  applyFrameLayout: applyFrameLayout,
-  /* Cloner */
-  clonePage:       cloneActivePage,
-  openClone:       openClone,
-  listClones:      listClones,
-  /* URL helpers */
-  isLocalURL:      isLocalURL,
-  fullURL:         fullURL,
-  copyActiveURL:   copyActiveURL,
-  copyURL:         copyToClipboard,
-};
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
 
-/* ============================================================
-   Boot
-   ============================================================ */
-connectLynk();
-setStatus('', 'Ready');
-if (!restoreTabs()){
-  addTab('https://duckduckgo.com');
-}
-window.addEventListener('beforeunload', function(){ saveTabs(); });
-
-setTimeout(applyFrameLayout, 60);
+  /* Public API */
+  window.LynkShell = {
+    createTab:    createTab,
+    setActiveTab: setActiveTab,
+    closeTab:     closeTab,
+    navigate:     navigateActive,
+    loadChunk:    loadChunk,
+    preload:      preloadChunks,
+    tabs:         function () { return tabs.slice(); },
+    active:       activeTab,
+  };
 })();
