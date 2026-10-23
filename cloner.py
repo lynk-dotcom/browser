@@ -2,15 +2,22 @@
 """
 Lynkio Cloner — full page/session/DOM/storage capture + rehydrate.
 
-v2: single handler for GET+DELETE /clone/* (Lynkio routing returns 405
-when a path matches but the method is missing on the first-matched route;
-combining avoids that trap).
+v3 changes:
+  • build_clone_html(clone, sid) now injects window.__LYNK_CTX__ so
+    interceptor.js runs on /clone/<uuid> pages (fetch/XHR/WS hooks
+    active — the app behaves exactly as on the proxied original).
+  • New route:  GET  /clone/<uuid>/edit      — professional code editor
+  • New route:  PUT  /clone/<uuid>/state     — update localStorage /
+                                                sessionStorage in a clone
+  • __LYNK_SW__ flag set on clone pages so the service worker is not
+    re-registered there (avoids double-interception).
 """
 
 import base64
 import copy
 import gzip
 import hashlib
+import html as _html_mod
 import json
 import logging
 import os
@@ -230,10 +237,38 @@ def state_payload(clone):
     }
 
 
-def build_clone_html(clone):
+def build_clone_html(clone, sid=None):
+    """
+    Insert hydrate bootstrap at the top of <head>.
+
+    CRITICAL: sets window.__LYNK_CTX__ BEFORE the original scripts run, so
+    interceptor.js (which is captured inside outer_html) will not bail out
+    on the `if (!ctx.upstream) return;` guard. Without this, fetch / XHR /
+    WebSocket hooks are not installed on the clone page and the app breaks.
+    """
     html = clone["outer_html"]
     state = state_payload(clone)
     blob = json.dumps(state, separators=(",", ":")).encode("utf-8")
+
+    ctx = {
+        "upstream": clone.get("source_url", ""),
+        "_injected": [
+            s["code"] for s in (clone.get("injected") or [])
+            if s.get("enabled")
+        ],
+    }
+    if sid:
+        ctx["sid"] = sid
+
+    # __LYNK_SW__ = 1 prevents the boot script from re-registering the
+    # service worker on clone pages (the SW was already registered from
+    # the /tabs or /proxy visit; re-registering here just causes noise).
+    ctx_script = (
+        '<script>'
+        f'window.__LYNK_CTX__ = {json.dumps(ctx, separators=(",", ":"))};'
+        'window.__LYNK_SW__ = 1;'
+        '</script>'
+    )
 
     if len(blob) <= INLINE_STATE_THRESHOLD:
         bootstrap = (
@@ -241,14 +276,16 @@ def build_clone_html(clone):
             'window.__LYNK_CLONE_STATE__='
             f'{json.dumps(state, separators=(",", ":"))};'
             '</script>'
-            '<script src="/static/js/cloner_hydrate.js"></script>'
+            + ctx_script
+            + '<script src="/static/js/cloner_hydrate.js"></script>'
         )
     else:
         bootstrap = (
             '<script>'
             f'window.__LYNK_CLONE_STATE_URL__="/clone/{clone["uuid"]}/state.json";'
             '</script>'
-            '<script src="/static/js/cloner_hydrate.js"></script>'
+            + ctx_script
+            + '<script src="/static/js/cloner_hydrate.js"></script>'
         )
 
     lower = html.lower()
@@ -267,15 +304,406 @@ def build_clone_html(clone):
 
 
 # ======================================================================
+# Editor page (professional, self-contained)
+# ======================================================================
+
+_EDITOR_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clone Editor · Lynkio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.css">
+<style>
+:root{
+  --bg:#070b16;--bg-2:#0d1526;--bg-3:#131d33;
+  --fg:#e2e8f0;--fg-muted:#94a3b8;--fg-dim:#64748b;
+  --line:rgba(148,163,184,.16);
+  --accent:#38bdf8;--accent-2:#818cf8;
+  --ok:#10b981;--warn:#f59e0b;--danger:#f87171;
+  --grad:linear-gradient(135deg,#38bdf8,#818cf8);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;
+  font-family:'Inter',system-ui,-apple-system,sans-serif;
+  background:var(--bg);color:var(--fg)}
+body{display:flex;flex-direction:column}
+.header{display:flex;align-items:center;gap:14px;padding:12px 18px;
+  background:var(--bg-2);border-bottom:1px solid var(--line);flex-shrink:0}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.mark{width:30px;height:30px;border-radius:8px;background:var(--grad);
+  display:grid;place-items:center;color:#0b1220;font-size:14px;font-weight:800;flex-shrink:0}
+.title{font-weight:700;font-size:13.5px;line-height:1.2}
+.subtitle{font-size:11px;color:var(--fg-dim);
+  font-family:'JetBrains Mono',monospace;max-width:400px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.spacer{flex:1}
+.status{font-family:'JetBrains Mono',monospace;font-size:11px;
+  padding:4px 10px;border-radius:6px;
+  background:rgba(148,163,184,.08);color:var(--fg-muted);white-space:nowrap}
+.status.saving{color:var(--warn)}
+.status.saved{color:var(--ok)}
+.status.error{color:var(--danger)}
+.btn{padding:6px 12px;border-radius:7px;border:1px solid rgba(148,163,184,.25);
+  background:transparent;color:var(--fg);font-family:inherit;font-size:12px;
+  font-weight:600;cursor:pointer;transition:.15s}
+.btn:hover{background:rgba(56,189,248,.1);border-color:rgba(56,189,248,.45);
+  color:var(--accent)}
+.btn.primary{background:var(--grad);color:#0b1220;border:none}
+.btn.primary:hover{filter:brightness(1.1)}
+.main{flex:1;display:grid;grid-template-columns:1fr 1fr;min-height:0}
+.editor-pane,.preview-pane{display:flex;flex-direction:column;
+  min-height:0;overflow:hidden}
+.editor-pane{border-right:1px solid var(--line);background:var(--bg-2)}
+.tabs{display:flex;gap:2px;padding:6px 8px 0;background:var(--bg-2);
+  border-bottom:1px solid var(--line);flex-shrink:0}
+.tab-btn{padding:7px 14px;border-radius:6px 6px 0 0;border:none;
+  background:transparent;color:var(--fg-muted);font-family:inherit;font-size:12px;
+  font-weight:600;cursor:pointer;border-bottom:2px solid transparent}
+.tab-btn:hover{color:var(--fg);background:rgba(148,163,184,.06)}
+.tab-btn.active{color:var(--accent);border-bottom-color:var(--accent);
+  background:rgba(56,189,248,.08)}
+.editor-host{flex:1;min-height:0;overflow:auto;background:#050a14}
+.editor-host.hidden{display:none}
+.CodeMirror{height:100% !important;background:#050a14 !important;
+  color:var(--fg) !important;font-family:'JetBrains Mono',ui-monospace,monospace !important;
+  font-size:12px !important;line-height:1.55 !important}
+.CodeMirror-gutters{background:#070b16 !important;
+  border-right:1px solid var(--line) !important}
+.CodeMirror-linenumber{color:var(--fg-dim) !important}
+.CodeMirror-cursor{border-left-color:var(--accent) !important}
+.CodeMirror-selected{background:rgba(56,189,248,.15) !important}
+.cm-tag{color:#f472b6 !important}
+.cm-attribute{color:#a78bfa !important}
+.cm-string{color:#34d399 !important}
+.cm-comment{color:#64748b !important;font-style:italic}
+.cm-number{color:#f59e0b !important}
+.cm-keyword{color:#38bdf8 !important}
+.state-textarea{width:100%;height:100%;min-height:200px;background:#050a14;
+  color:var(--fg);border:none;padding:14px;
+  font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;
+  line-height:1.55;outline:none;resize:none;box-sizing:border-box}
+.preview-toolbar{display:flex;align-items:center;gap:10px;padding:8px 14px;
+  background:var(--bg-2);border-bottom:1px solid var(--line);flex-shrink:0}
+.preview-toolbar .label{font-size:11px;color:var(--fg-dim);
+  font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.preview-toolbar .btn{padding:4px 10px;font-size:11px}
+.preview-toolbar .preview-url{font-family:'JetBrains Mono',monospace;
+  font-size:11px;color:var(--fg-dim);flex:1;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+#previewFrame{flex:1;width:100%;border:none;background:#fff;min-height:0}
+.footer{padding:4px 14px;background:var(--bg-2);
+  border-top:1px solid var(--line);font-size:11px;color:var(--fg-dim);
+  font-family:'JetBrains Mono',monospace;display:flex;gap:14px;flex-shrink:0}
+.toast{position:fixed;bottom:24px;right:24px;padding:10px 16px;
+  border-radius:8px;background:var(--bg-3);border:1px solid var(--line);
+  color:var(--fg);font-size:12.5px;font-weight:600;
+  box-shadow:0 8px 24px rgba(0,0,0,.4);transform:translateY(80px);
+  opacity:0;transition:.25s cubic-bezier(.34,1.36,.64,1);pointer-events:none;
+  z-index:1000}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.error{border-color:rgba(248,113,113,.4);color:var(--danger)}
+.toast.ok{border-color:rgba(16,185,129,.4);color:var(--ok)}
+.spin{display:inline-block;width:10px;height:10px;border:2px solid currentColor;
+  border-top-color:transparent;border-radius:50%;
+  animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:900px){
+  .main{grid-template-columns:1fr}
+  .editor-pane{border-right:none;border-bottom:1px solid var(--line);max-height:50vh}
+  .preview-pane{min-height:50vh}
+  .subtitle{max-width:180px}
+}
+</style></head><body>
+
+<header class="header">
+  <div class="brand">
+    <div class="mark">L</div>
+    <div>
+      <div class="title">Clone Editor</div>
+      <div class="subtitle" id="subtitle">{{UUID}} · {{SOURCE_URL}}</div>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <div class="status" id="saveStatus">Ready</div>
+  <button class="btn" id="btnSaveNow" title="Force save">Save now</button>
+  <button class="btn" id="btnPreview" title="Reload preview">↻ Reload preview</button>
+  <button class="btn" id="btnBack" title="Back to browser">← Back</button>
+</header>
+
+<main class="main">
+  <section class="editor-pane">
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="html">HTML</button>
+      <button class="tab-btn" data-tab="localStorage">localStorage</button>
+      <button class="tab-btn" data-tab="sessionStorage">sessionStorage</button>
+    </div>
+    <div class="editor-host" id="htmlEditor"></div>
+    <div class="editor-host hidden" id="lsEditor">
+      <textarea class="state-textarea" id="lsTextarea" spellcheck="false"></textarea>
+    </div>
+    <div class="editor-host hidden" id="ssEditor">
+      <textarea class="state-textarea" id="ssTextarea" spellcheck="false"></textarea>
+    </div>
+  </section>
+  <section class="preview-pane">
+    <div class="preview-toolbar">
+      <span class="label">Preview</span>
+      <span class="preview-url" id="previewUrl">/clone/{{UUID}}</span>
+      <button class="btn" id="btnOpenPreview" title="Open in new tab">Open ↗</button>
+    </div>
+    <iframe id="previewFrame" src="/clone/{{UUID}}"></iframe>
+  </section>
+</main>
+
+<div class="footer">
+  <span>UUID: {{UUID}}</span>
+  <span id="ftEditCount">Edits: 0</span>
+  <span id="ftLastEdit">Last edit: —</span>
+  <span>Auto-save: 600ms</span>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/xml/xml.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/javascript/javascript.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/css/css.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/mode/htmlmixed/htmlmixed.js"></script>
+<script>
+(function() {
+  'use strict';
+  var UUID = '{{UUID}}';
+  var SAVE_DEBOUNCE_MS = 600;
+
+  var elStatus = document.getElementById('saveStatus');
+  var elToast = document.getElementById('toast');
+  var elPreviewFrame = document.getElementById('previewFrame');
+  var elHtmlHost = document.getElementById('htmlEditor');
+  var elHtmlHostLs = document.getElementById('lsEditor');
+  var elHtmlHostSs = document.getElementById('ssEditor');
+  var elLsTextarea = document.getElementById('lsTextarea');
+  var elSsTextarea = document.getElementById('ssTextarea');
+  var elFtEditCount = document.getElementById('ftEditCount');
+  var elFtLastEdit = document.getElementById('ftLastEdit');
+
+  var cm = null;
+  var activeTab = 'html';
+  var saveTimer = null;
+  var isSaving = false;
+  var needsResave = false;
+  var dirty = false;
+
+  var toastTimer = null;
+  function toast(msg, kind) {
+    elToast.textContent = msg;
+    elToast.className = 'toast show' + (kind ? ' ' + kind : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ elToast.classList.remove('show'); }, 2400);
+  }
+
+  function setStatus(kind, text) {
+    elStatus.className = 'status' + (kind ? ' ' + kind : '');
+    elStatus.textContent = text || 'Ready';
+    if (kind === 'saving') {
+      var sp = document.createElement('span');
+      sp.className = 'spin';
+      elStatus.insertBefore(sp, elStatus.firstChild);
+    }
+  }
+
+  async function loadSource() {
+    var r = await fetch('/clone/' + UUID + '/source', { credentials: 'same-origin' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+  async function loadMeta() {
+    try {
+      var r = await fetch('/clone/' + UUID + '/meta', { credentials: 'same-origin' });
+      return r.ok ? r.json() : {};
+    } catch(e) { return {}; }
+  }
+  async function loadState() {
+    try {
+      var r = await fetch('/clone/' + UUID + '/state.json', { credentials: 'same-origin' });
+      return r.ok ? r.json() : {};
+    } catch(e) { return {}; }
+  }
+
+  function initEditor(initialHtml) {
+    if (typeof CodeMirror === 'undefined') {
+      var ta = document.createElement('textarea');
+      ta.className = 'state-textarea';
+      ta.value = initialHtml;
+      ta.spellcheck = false;
+      ta.addEventListener('input', onHtmlChange);
+      elHtmlHost.appendChild(ta);
+      cm = { getValue: function(){ return ta.value; }, refresh: function(){} };
+      return;
+    }
+    cm = CodeMirror(elHtmlHost, {
+      value: initialHtml,
+      mode: 'htmlmixed',
+      lineNumbers: true,
+      lineWrapping: true,
+      matchBrackets: true,
+      autoCloseBrackets: true,
+      autoCloseTags: true,
+      indentUnit: 2,
+      tabSize: 2,
+      indentWithTabs: false,
+    });
+    cm.on('change', onHtmlChange);
+  }
+
+  function onHtmlChange(){ dirty = true; scheduleSave(); }
+  function onStateChange(){ dirty = true; scheduleSave(); }
+
+  function scheduleSave(){
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
+    setStatus('saving', 'Saving…');
+  }
+
+  async function saveNow(){
+    if (isSaving) { needsResave = true; return; }
+    isSaving = true;
+    needsResave = false;
+    try {
+      if (activeTab === 'html') {
+        var html = cm.getValue();
+        var r = await fetch('/clone/' + UUID + '/source', {
+          method: 'PUT',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ outer_html: html }),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        var j = await r.json();
+        if (!j.ok) throw new Error(j.error || 'Save failed');
+        updateEditMeta(j.edit_count);
+      } else if (activeTab === 'localStorage') {
+        var raw = elLsTextarea.value;
+        var obj;
+        try { obj = JSON.parse(raw || '{}'); }
+        catch(e) { throw new Error('Invalid JSON: ' + e.message); }
+        var r2 = await fetch('/clone/' + UUID + '/state', {
+          method: 'PUT',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ local_storage: obj }),
+        });
+        if (!r2.ok) throw new Error('HTTP ' + r2.status);
+        var j2 = await r2.json();
+        if (!j2.ok) throw new Error(j2.error || 'Save failed');
+        updateEditMeta(j2.edit_count);
+      } else if (activeTab === 'sessionStorage') {
+        var raw2 = elSsTextarea.value;
+        var obj2;
+        try { obj2 = JSON.parse(raw2 || '{}'); }
+        catch(e) { throw new Error('Invalid JSON: ' + e.message); }
+        var r3 = await fetch('/clone/' + UUID + '/state', {
+          method: 'PUT',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_storage: obj2 }),
+        });
+        if (!r3.ok) throw new Error('HTTP ' + r3.status);
+        var j3 = await r3.json();
+        if (!j3.ok) throw new Error(j3.error || 'Save failed');
+        updateEditMeta(j3.edit_count);
+      }
+      dirty = false;
+      setStatus('saved', 'Saved');
+      refreshPreview();
+    } catch(e){
+      setStatus('error', 'Error');
+      toast(e.message || 'Save failed', 'error');
+    } finally {
+      isSaving = false;
+      if (needsResave) { needsResave = false; scheduleSave(); }
+    }
+  }
+
+  function updateEditMeta(count){
+    if (typeof count === 'number') elFtEditCount.textContent = 'Edits: ' + count;
+    elFtLastEdit.textContent = 'Last edit: ' + new Date().toLocaleTimeString();
+  }
+  function refreshPreview(){
+    elPreviewFrame.src = '/clone/' + UUID + '?t=' + Date.now();
+  }
+
+  document.querySelectorAll('.tab-btn').forEach(function(btn){
+    btn.addEventListener('click', async function(){
+      if (dirty) await saveNow();
+      var tab = btn.getAttribute('data-tab');
+      if (tab === activeTab) return;
+      activeTab = tab;
+      document.querySelectorAll('.tab-btn').forEach(function(b){
+        b.classList.toggle('active', b === btn);
+      });
+      elHtmlHost.classList.toggle('hidden', tab !== 'html');
+      elHtmlHostLs.classList.toggle('hidden', tab !== 'localStorage');
+      elHtmlHostSs.classList.toggle('hidden', tab !== 'sessionStorage');
+      if (cm && cm.refresh) setTimeout(function(){ cm.refresh(); }, 30);
+    });
+  });
+
+  document.getElementById('btnSaveNow').addEventListener('click', function(){
+    clearTimeout(saveTimer);
+    saveNow();
+  });
+  document.getElementById('btnPreview').addEventListener('click', refreshPreview);
+  document.getElementById('btnOpenPreview').addEventListener('click', function(){
+    window.open('/clone/' + UUID, '_blank');
+  });
+  document.getElementById('btnBack').addEventListener('click', function(){
+    if (window.history.length > 1) window.history.back();
+    else window.location.href = '/tabs';
+  });
+
+  window.addEventListener('beforeunload', function(e){
+    if (dirty || isSaving) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  (async function boot(){
+    setStatus('saving', 'Loading…');
+    try {
+      var source = await loadSource();
+      var state = await loadState();
+      var meta = await loadMeta();
+      updateEditMeta(meta.edit_count || 0);
+      if (meta.last_edit_ts) {
+        elFtLastEdit.textContent = 'Last edit: ' + new Date(meta.last_edit_ts * 1000).toLocaleString();
+      }
+      initEditor(source.outer_html || '');
+      elLsTextarea.value = JSON.stringify(state.local_storage || {}, null, 2);
+      elLsTextarea.addEventListener('input', onStateChange);
+      elSsTextarea.value = JSON.stringify(state.session_storage || {}, null, 2);
+      elSsTextarea.addEventListener('input', onStateChange);
+      setStatus('', 'Ready');
+    } catch(e){
+      setStatus('error', 'Load failed');
+      toast('Load failed: ' + e.message, 'error');
+    }
+  })();
+})();
+</script>
+</body></html>
+"""
+
+
+def _build_editor_html(clone):
+    uuid_safe = _html_mod.escape(clone.get("uuid", ""), quote=True)
+    src_safe  = _html_mod.escape(clone.get("source_url", ""), quote=True)
+    return _EDITOR_HTML.replace("{{UUID}}", uuid_safe).replace("{{SOURCE_URL}}", src_safe)
+
+
+# ======================================================================
 # Route installer
 # ======================================================================
 
 def install(app, ctx):
-    """
-    ctx keys required:
-        get_session, Session, RawResponse, json_response, error_page,
-        SESSION_COOKIE, session_from_req, SESSIONS
-    """
     get_session      = ctx["get_session"]
     Session          = ctx["Session"]
     RawResponse      = ctx["RawResponse"]
@@ -293,7 +721,6 @@ def install(app, ctx):
             new = True
         return vid, new
 
-    # ---- capture from live page (exact POST) -----------------------
     @app.route("/clone/capture-client", methods=["POST"])
     async def clone_capture_client(req):
         sid, _ = session_from_req(req)
@@ -321,7 +748,6 @@ def install(app, ctx):
             "source_url": clone["source_url"],
         })
 
-    # ---- import (exact POST) ---------------------------------------
     @app.route("/clone/import", methods=["POST"])
     async def clone_import(req):
         body = req.body or b""
@@ -343,13 +769,10 @@ def install(app, ctx):
             return json_response({"error": str(e)}, status=413)
         return json_response({"uuid": c["uuid"], "url": f"/clone/{c['uuid']}"})
 
-    # ---- list (exact GET) ------------------------------------------
     @app.get("/clones")
     async def clones_index(req):
         return json_response({"clones": list_clones()})
 
-    # ---- per-clone sub-resources (specific wildcards) --------------
-    # These come BEFORE /clone/* so they match first within wild_routes.
     @app.get("/clone/*/state.json")
     async def clone_state_json(req, wildcard=""):
         cid = (wildcard or "").split("/", 1)[0].strip()
@@ -357,6 +780,30 @@ def install(app, ctx):
         if not c:
             return json_response({"error": "not found"}, status=404)
         return json_response(state_payload(c))
+
+    @app.route("/clone/*/state", methods=["PUT"])
+    async def clone_state_put(req, wildcard=""):
+        cid = (wildcard or "").split("/", 1)[0].strip()
+        c = load_clone(cid)
+        if not c:
+            return json_response({"error": "not found"}, status=404)
+        try:
+            payload = json.loads((req.body or b"{}").decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            return json_response({"error": "invalid JSON"}, status=400)
+        if "local_storage" in payload:
+            c["local_storage"] = payload["local_storage"] if isinstance(payload["local_storage"], dict) else {}
+        if "session_storage" in payload:
+            c["session_storage"] = payload["session_storage"] if isinstance(payload["session_storage"], dict) else {}
+        if "document_cookies" in payload:
+            c["document_cookies"] = str(payload["document_cookies"] or "")
+        c["edit_count"] = int(c.get("edit_count", 0)) + 1
+        c["last_edit_ts"] = time.time()
+        try:
+            save_clone(c)
+        except ValueError as e:
+            return json_response({"error": str(e)}, status=413)
+        return json_response({"ok": True, "edit_count": c["edit_count"]})
 
     @app.get("/clone/*/source")
     async def clone_source_get(req, wildcard=""):
@@ -438,10 +885,16 @@ def install(app, ctx):
                         f'attachment; filename="{cid}.lynkclone"')
         return resp
 
-    # ---- serve OR delete a clone (ONE handler, both methods) -------
-    # Combining GET + DELETE avoids Lynkio's "path matches but method
-    # missing → 405 and stop" behaviour when two routes share the same
-    # wildcard pattern.
+    @app.get("/clone/*/edit")
+    async def clone_edit(req, wildcard=""):
+        cid = (wildcard or "").split("/", 1)[0].strip()
+        c = load_clone(cid)
+        if not c:
+            return error_page("Clone not found", f"No clone <code>{cid}</code>.", 404)
+        html = _build_editor_html(c)
+        return RawResponse(html.encode("utf-8"),
+                           content_type="text/html; charset=utf-8")
+
     @app.route("/clone/*", methods=["GET", "DELETE"])
     async def clone_route(req, wildcard=""):
         raw = (wildcard or "").split("?", 1)[0]
@@ -453,7 +906,6 @@ def install(app, ctx):
             ok = delete_clone(cid)
             return json_response({"ok": ok}, status=200 if ok else 404)
 
-        # GET — serve the clone
         clone = load_clone(cid)
         if not clone:
             return error_page(
@@ -471,7 +923,7 @@ def install(app, ctx):
             SESSIONS[sid] = sess
         SESSIONS[sid].touch()
 
-        html = build_clone_html(clone)
+        html = build_clone_html(clone, sid)
         resp = RawResponse(html.encode("utf-8"),
                            content_type="text/html; charset=utf-8")
         resp.add_header(
