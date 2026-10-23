@@ -2,15 +2,13 @@
 """
 Lynkio Cloner — full page/session/DOM/storage capture + rehydrate.
 
-v3 changes:
-  • build_clone_html(clone, sid) now injects window.__LYNK_CTX__ so
-    interceptor.js runs on /clone/<uuid> pages (fetch/XHR/WS hooks
-    active — the app behaves exactly as on the proxied original).
-  • New route:  GET  /clone/<uuid>/edit      — professional code editor
-  • New route:  PUT  /clone/<uuid>/state     — update localStorage /
-                                                sessionStorage in a clone
-  • __LYNK_SW__ flag set on clone pages so the service worker is not
-    re-registered there (avoids double-interception).
+v4 changes:
+  • _json_for_script() escapes `</` in every JSON dumped inside a <script>
+    tag. Without this, JSON containing `</script>` (common in Facebook /
+    Instagram error payloads) closes the tag early and the rest of the
+    JSON is rendered as visible page text on the clone.
+  • State is now embedded in <script type="application/json"> and read
+    via JSON.parse in cloner_hydrate.js — never as inline JS assignment.
 """
 
 import base64
@@ -38,6 +36,25 @@ MAX_STORED_BYTES       = 512 * 1024 * 1024
 INLINE_STATE_THRESHOLD = 8 * 1024 * 1024
 
 CLONE_VISITOR_COOKIE = "__lynk_clone_vid"
+
+
+# ======================================================================
+# Safe JSON for <script> tags
+# ======================================================================
+
+def _json_for_script(obj):
+    """
+    Return obj as a JSON string safe to embed inside <script>...</script>.
+
+    Escapes `</` → `<\\/` so the browser parser doesn't see a closing tag
+    mid-JSON. `\\/` is a valid JSON (and JS) escape for `/`, so parsing
+    restores the original value exactly.
+    Also escapes U+2028 / U+2029 (line separators) which break inline JS.
+    """
+    s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    s = s.replace("</", "<\\/")
+    s = s.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return s
 
 
 # ======================================================================
@@ -238,16 +255,10 @@ def state_payload(clone):
 
 
 def build_clone_html(clone, sid=None):
-    """
-    Insert hydrate bootstrap at the top of <head>.
-
-    CRITICAL: sets window.__LYNK_CTX__ BEFORE the original scripts run, so
-    interceptor.js (which is captured inside outer_html) will not bail out
-    on the `if (!ctx.upstream) return;` guard. Without this, fetch / XHR /
-    WebSocket hooks are not installed on the clone page and the app breaks.
-    """
+    """Insert hydrate bootstrap at the top of <head>."""
     html = clone["outer_html"]
     state = state_payload(clone)
+    # Size check uses json.dumps default (no escaping) — close enough.
     blob = json.dumps(state, separators=(",", ":")).encode("utf-8")
 
     ctx = {
@@ -260,22 +271,21 @@ def build_clone_html(clone, sid=None):
     if sid:
         ctx["sid"] = sid
 
-    # __LYNK_SW__ = 1 prevents the boot script from re-registering the
-    # service worker on clone pages (the SW was already registered from
-    # the /tabs or /proxy visit; re-registering here just causes noise).
+    # Escape </ in both JSON blobs so the browser parser can't see a
+    # premature closing tag inside them.
     ctx_script = (
         '<script>'
-        f'window.__LYNK_CTX__ = {json.dumps(ctx, separators=(",", ":"))};'
-        'window.__LYNK_SW__ = 1;'
+        f'window.__LYNK_CTX__={_json_for_script(ctx)};'
+        'window.__LYNK_SW__=1;'
         '</script>'
     )
 
     if len(blob) <= INLINE_STATE_THRESHOLD:
+        state_json = _json_for_script(state)
         bootstrap = (
-            '<script id="__lynk_clone_state">'
-            'window.__LYNK_CLONE_STATE__='
-            f'{json.dumps(state, separators=(",", ":"))};'
-            '</script>'
+            '<script type="application/json" id="__lynk_clone_state">'
+            + state_json
+            + '</script>'
             + ctx_script
             + '<script src="/static/js/cloner_hydrate.js"></script>'
         )
@@ -304,7 +314,7 @@ def build_clone_html(clone, sid=None):
 
 
 # ======================================================================
-# Editor page (professional, self-contained)
+# Editor page
 # ======================================================================
 
 _EDITOR_HTML = """<!DOCTYPE html>
@@ -315,105 +325,88 @@ _EDITOR_HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.16/lib/codemirror.css">
 <style>
-:root{
-  --bg:#070b16;--bg-2:#0d1526;--bg-3:#131d33;
-  --fg:#e2e8f0;--fg-muted:#94a3b8;--fg-dim:#64748b;
-  --line:rgba(148,163,184,.16);
-  --accent:#38bdf8;--accent-2:#818cf8;
-  --ok:#10b981;--warn:#f59e0b;--danger:#f87171;
-  --grad:linear-gradient(135deg,#38bdf8,#818cf8);
-}
+:root{--bg:#070b16;--bg-2:#0d1526;--bg-3:#131d33;--fg:#e2e8f0;--fg-muted:#94a3b8;
+--fg-dim:#64748b;--line:rgba(148,163,184,.16);--accent:#38bdf8;
+--ok:#10b981;--warn:#f59e0b;--danger:#f87171;--grad:linear-gradient(135deg,#38bdf8,#818cf8)}
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{height:100%;overflow:hidden;
-  font-family:'Inter',system-ui,-apple-system,sans-serif;
-  background:var(--bg);color:var(--fg)}
+html,body{height:100%;overflow:hidden;font-family:'Inter',system-ui,-apple-system,sans-serif;
+background:var(--bg);color:var(--fg)}
 body{display:flex;flex-direction:column}
-.header{display:flex;align-items:center;gap:14px;padding:12px 18px;
-  background:var(--bg-2);border-bottom:1px solid var(--line);flex-shrink:0}
+.header{display:flex;align-items:center;gap:14px;padding:12px 18px;background:var(--bg-2);
+border-bottom:1px solid var(--line);flex-shrink:0}
 .brand{display:flex;align-items:center;gap:10px;min-width:0}
-.mark{width:30px;height:30px;border-radius:8px;background:var(--grad);
-  display:grid;place-items:center;color:#0b1220;font-size:14px;font-weight:800;flex-shrink:0}
+.mark{width:30px;height:30px;border-radius:8px;background:var(--grad);display:grid;
+place-items:center;color:#0b1220;font-size:14px;font-weight:800;flex-shrink:0}
 .title{font-weight:700;font-size:13.5px;line-height:1.2}
-.subtitle{font-size:11px;color:var(--fg-dim);
-  font-family:'JetBrains Mono',monospace;max-width:400px;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
+.subtitle{font-size:11px;color:var(--fg-dim);font-family:'JetBrains Mono',monospace;
+max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .spacer{flex:1}
-.status{font-family:'JetBrains Mono',monospace;font-size:11px;
-  padding:4px 10px;border-radius:6px;
-  background:rgba(148,163,184,.08);color:var(--fg-muted);white-space:nowrap}
+.status{font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 10px;
+border-radius:6px;background:rgba(148,163,184,.08);color:var(--fg-muted);white-space:nowrap}
 .status.saving{color:var(--warn)}
 .status.saved{color:var(--ok)}
 .status.error{color:var(--danger)}
 .btn{padding:6px 12px;border-radius:7px;border:1px solid rgba(148,163,184,.25);
-  background:transparent;color:var(--fg);font-family:inherit;font-size:12px;
-  font-weight:600;cursor:pointer;transition:.15s}
-.btn:hover{background:rgba(56,189,248,.1);border-color:rgba(56,189,248,.45);
-  color:var(--accent)}
+background:transparent;color:var(--fg);font-family:inherit;font-size:12px;font-weight:600;
+cursor:pointer;transition:.15s}
+.btn:hover{background:rgba(56,189,248,.1);border-color:rgba(56,189,248,.45);color:var(--accent)}
 .btn.primary{background:var(--grad);color:#0b1220;border:none}
-.btn.primary:hover{filter:brightness(1.1)}
 .main{flex:1;display:grid;grid-template-columns:1fr 1fr;min-height:0}
-.editor-pane,.preview-pane{display:flex;flex-direction:column;
-  min-height:0;overflow:hidden}
+.editor-pane,.preview-pane{display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .editor-pane{border-right:1px solid var(--line);background:var(--bg-2)}
 .tabs{display:flex;gap:2px;padding:6px 8px 0;background:var(--bg-2);
-  border-bottom:1px solid var(--line);flex-shrink:0}
-.tab-btn{padding:7px 14px;border-radius:6px 6px 0 0;border:none;
-  background:transparent;color:var(--fg-muted);font-family:inherit;font-size:12px;
-  font-weight:600;cursor:pointer;border-bottom:2px solid transparent}
+border-bottom:1px solid var(--line);flex-shrink:0}
+.tab-btn{padding:7px 14px;border-radius:6px 6px 0 0;border:none;background:transparent;
+color:var(--fg-muted);font-family:inherit;font-size:12px;font-weight:600;cursor:pointer;
+border-bottom:2px solid transparent}
 .tab-btn:hover{color:var(--fg);background:rgba(148,163,184,.06)}
 .tab-btn.active{color:var(--accent);border-bottom-color:var(--accent);
-  background:rgba(56,189,248,.08)}
+background:rgba(56,189,248,.08)}
 .editor-host{flex:1;min-height:0;overflow:auto;background:#050a14}
 .editor-host.hidden{display:none}
-.CodeMirror{height:100% !important;background:#050a14 !important;
-  color:var(--fg) !important;font-family:'JetBrains Mono',ui-monospace,monospace !important;
-  font-size:12px !important;line-height:1.55 !important}
-.CodeMirror-gutters{background:#070b16 !important;
-  border-right:1px solid var(--line) !important}
+.CodeMirror{height:100% !important;background:#050a14 !important;color:var(--fg) !important;
+font-family:'JetBrains Mono',ui-monospace,monospace !important;font-size:12px !important;
+line-height:1.55 !important}
+.CodeMirror-gutters{background:#070b16 !important;border-right:1px solid var(--line) !important}
 .CodeMirror-linenumber{color:var(--fg-dim) !important}
 .CodeMirror-cursor{border-left-color:var(--accent) !important}
-.CodeMirror-selected{background:rgba(56,189,248,.15) !important}
 .cm-tag{color:#f472b6 !important}
 .cm-attribute{color:#a78bfa !important}
 .cm-string{color:#34d399 !important}
 .cm-comment{color:#64748b !important;font-style:italic}
 .cm-number{color:#f59e0b !important}
 .cm-keyword{color:#38bdf8 !important}
-.state-textarea{width:100%;height:100%;min-height:200px;background:#050a14;
-  color:var(--fg);border:none;padding:14px;
-  font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;
-  line-height:1.55;outline:none;resize:none;box-sizing:border-box}
+.state-textarea{width:100%;height:100%;min-height:200px;background:#050a14;color:var(--fg);
+border:none;padding:14px;font-family:'JetBrains Mono',ui-monospace,monospace;
+font-size:12px;line-height:1.55;outline:none;resize:none;box-sizing:border-box}
 .preview-toolbar{display:flex;align-items:center;gap:10px;padding:8px 14px;
-  background:var(--bg-2);border-bottom:1px solid var(--line);flex-shrink:0}
-.preview-toolbar .label{font-size:11px;color:var(--fg-dim);
-  font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+background:var(--bg-2);border-bottom:1px solid var(--line);flex-shrink:0}
+.preview-toolbar .label{font-size:11px;color:var(--fg-dim);font-weight:600;
+text-transform:uppercase;letter-spacing:.06em}
 .preview-toolbar .btn{padding:4px 10px;font-size:11px}
-.preview-toolbar .preview-url{font-family:'JetBrains Mono',monospace;
-  font-size:11px;color:var(--fg-dim);flex:1;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
+.preview-toolbar .preview-url{font-family:'JetBrains Mono',monospace;font-size:11px;
+color:var(--fg-dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #previewFrame{flex:1;width:100%;border:none;background:#fff;min-height:0}
-.footer{padding:4px 14px;background:var(--bg-2);
-  border-top:1px solid var(--line);font-size:11px;color:var(--fg-dim);
-  font-family:'JetBrains Mono',monospace;display:flex;gap:14px;flex-shrink:0}
-.toast{position:fixed;bottom:24px;right:24px;padding:10px 16px;
-  border-radius:8px;background:var(--bg-3);border:1px solid var(--line);
-  color:var(--fg);font-size:12.5px;font-weight:600;
-  box-shadow:0 8px 24px rgba(0,0,0,.4);transform:translateY(80px);
-  opacity:0;transition:.25s cubic-bezier(.34,1.36,.64,1);pointer-events:none;
-  z-index:1000}
+.footer{padding:4px 14px;background:var(--bg-2);border-top:1px solid var(--line);
+font-size:11px;color:var(--fg-dim);font-family:'JetBrains Mono',monospace;
+display:flex;gap:14px;flex-shrink:0}
+.toast{position:fixed;bottom:24px;right:24px;padding:10px 16px;border-radius:8px;
+background:var(--bg-3);border:1px solid var(--line);color:var(--fg);
+font-size:12.5px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.4);
+transform:translateY(80px);opacity:0;transition:.25s cubic-bezier(.34,1.36,.64,1);
+pointer-events:none;z-index:1000}
 .toast.show{transform:translateY(0);opacity:1}
 .toast.error{border-color:rgba(248,113,113,.4);color:var(--danger)}
 .toast.ok{border-color:rgba(16,185,129,.4);color:var(--ok)}
 .spin{display:inline-block;width:10px;height:10px;border:2px solid currentColor;
-  border-top-color:transparent;border-radius:50%;
-  animation:spin .8s linear infinite;vertical-align:middle;margin-right:6px}
+border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;
+vertical-align:middle;margin-right:6px}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:900px){
-  .main{grid-template-columns:1fr}
-  .editor-pane{border-right:none;border-bottom:1px solid var(--line);max-height:50vh}
-  .preview-pane{min-height:50vh}
-  .subtitle{max-width:180px}
-}
+.main{grid-template-columns:1fr}
+.editor-pane{border-right:none;border-bottom:1px solid var(--line);max-height:50vh}
+.preview-pane{min-height:50vh}
+.subtitle{max-width:180px}}
 </style></head><body>
 
 <header class="header">
@@ -501,7 +494,6 @@ body{display:flex;flex-direction:column}
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function(){ elToast.classList.remove('show'); }, 2400);
   }
-
   function setStatus(kind, text) {
     elStatus.className = 'status' + (kind ? ' ' + kind : '');
     elStatus.textContent = text || 'Ready';
@@ -511,7 +503,6 @@ body{display:flex;flex-direction:column}
       elStatus.insertBefore(sp, elStatus.firstChild);
     }
   }
-
   async function loadSource() {
     var r = await fetch('/clone/' + UUID + '/source', { credentials: 'same-origin' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -529,7 +520,6 @@ body{display:flex;flex-direction:column}
       return r.ok ? r.json() : {};
     } catch(e) { return {}; }
   }
-
   function initEditor(initialHtml) {
     if (typeof CodeMirror === 'undefined') {
       var ta = document.createElement('textarea');
@@ -542,39 +532,27 @@ body{display:flex;flex-direction:column}
       return;
     }
     cm = CodeMirror(elHtmlHost, {
-      value: initialHtml,
-      mode: 'htmlmixed',
-      lineNumbers: true,
-      lineWrapping: true,
-      matchBrackets: true,
-      autoCloseBrackets: true,
-      autoCloseTags: true,
-      indentUnit: 2,
-      tabSize: 2,
-      indentWithTabs: false,
+      value: initialHtml, mode: 'htmlmixed', lineNumbers: true,
+      lineWrapping: true, matchBrackets: true, autoCloseBrackets: true,
+      autoCloseTags: true, indentUnit: 2, tabSize: 2, indentWithTabs: false,
     });
     cm.on('change', onHtmlChange);
   }
-
   function onHtmlChange(){ dirty = true; scheduleSave(); }
   function onStateChange(){ dirty = true; scheduleSave(); }
-
   function scheduleSave(){
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
     setStatus('saving', 'Saving…');
   }
-
   async function saveNow(){
     if (isSaving) { needsResave = true; return; }
-    isSaving = true;
-    needsResave = false;
+    isSaving = true; needsResave = false;
     try {
       if (activeTab === 'html') {
         var html = cm.getValue();
         var r = await fetch('/clone/' + UUID + '/source', {
-          method: 'PUT',
-          credentials: 'same-origin',
+          method: 'PUT', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ outer_html: html }),
         });
@@ -583,13 +561,11 @@ body{display:flex;flex-direction:column}
         if (!j.ok) throw new Error(j.error || 'Save failed');
         updateEditMeta(j.edit_count);
       } else if (activeTab === 'localStorage') {
-        var raw = elLsTextarea.value;
-        var obj;
+        var raw = elLsTextarea.value, obj;
         try { obj = JSON.parse(raw || '{}'); }
         catch(e) { throw new Error('Invalid JSON: ' + e.message); }
         var r2 = await fetch('/clone/' + UUID + '/state', {
-          method: 'PUT',
-          credentials: 'same-origin',
+          method: 'PUT', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ local_storage: obj }),
         });
@@ -598,13 +574,11 @@ body{display:flex;flex-direction:column}
         if (!j2.ok) throw new Error(j2.error || 'Save failed');
         updateEditMeta(j2.edit_count);
       } else if (activeTab === 'sessionStorage') {
-        var raw2 = elSsTextarea.value;
-        var obj2;
+        var raw2 = elSsTextarea.value, obj2;
         try { obj2 = JSON.parse(raw2 || '{}'); }
         catch(e) { throw new Error('Invalid JSON: ' + e.message); }
         var r3 = await fetch('/clone/' + UUID + '/state', {
-          method: 'PUT',
-          credentials: 'same-origin',
+          method: 'PUT', credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_storage: obj2 }),
         });
@@ -624,7 +598,6 @@ body{display:flex;flex-direction:column}
       if (needsResave) { needsResave = false; scheduleSave(); }
     }
   }
-
   function updateEditMeta(count){
     if (typeof count === 'number') elFtEditCount.textContent = 'Edits: ' + count;
     elFtLastEdit.textContent = 'Last edit: ' + new Date().toLocaleTimeString();
@@ -632,7 +605,6 @@ body{display:flex;flex-direction:column}
   function refreshPreview(){
     elPreviewFrame.src = '/clone/' + UUID + '?t=' + Date.now();
   }
-
   document.querySelectorAll('.tab-btn').forEach(function(btn){
     btn.addEventListener('click', async function(){
       if (dirty) await saveNow();
@@ -648,10 +620,8 @@ body{display:flex;flex-direction:column}
       if (cm && cm.refresh) setTimeout(function(){ cm.refresh(); }, 30);
     });
   });
-
   document.getElementById('btnSaveNow').addEventListener('click', function(){
-    clearTimeout(saveTimer);
-    saveNow();
+    clearTimeout(saveTimer); saveNow();
   });
   document.getElementById('btnPreview').addEventListener('click', refreshPreview);
   document.getElementById('btnOpenPreview').addEventListener('click', function(){
@@ -661,11 +631,9 @@ body{display:flex;flex-direction:column}
     if (window.history.length > 1) window.history.back();
     else window.location.href = '/tabs';
   });
-
   window.addEventListener('beforeunload', function(e){
     if (dirty || isSaving) { e.preventDefault(); e.returnValue = ''; }
   });
-
   (async function boot(){
     setStatus('saving', 'Loading…');
     try {
