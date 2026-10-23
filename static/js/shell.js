@@ -1,13 +1,11 @@
-/* Lynkio shell — tab strip, URL bar, console, palette, WS control plane,
-   public API for the toolkit.
-
-   v18.5: local Lynkio routes (/clone/*, /clones, /tabs, /static/*, /tool/*,
-   /__lynk_*, /) load directly in the iframe, not through /proxy.
-   Toolbar copy-URL button, tab context menu entry, Ctrl+Shift+C. */
+/* Lynkio shell — v20.0
+   Adds: real Chrome tab strip via CDP, one-click capture, graceful fallback
+   when Chrome isn't available. */
 (function(){
 "use strict";
 if (window.__LYNK_SHELL__) return;
-window.__LYNK_SHELL__ = true;
+try { Object.defineProperty(window, '__LYNK_SHELL__', { value: true, enumerable: false }); }
+catch(e) { window.__LYNK_SHELL__ = true; }
 
 var LOAD_WATCHDOG   = 45000;
 var BOOKMARK_KEY    = '__lynk_bookmarks_v4';
@@ -32,7 +30,7 @@ var consoleOnlyActive = false;
 var consoleSeq        = 0;
 var consoleAutoScroll = true;
 
-var _layoutTimer      = null;
+var _layoutTimer = null;
 
 var stack          = document.getElementById('stack');
 var tabList        = document.getElementById('tabs');
@@ -60,6 +58,9 @@ var consoleList    = document.getElementById('consoleList');
 var consoleTotal   = document.getElementById('consoleTotal');
 var zoomLevelEl    = document.getElementById('zoomLevel');
 var desktopToggleEl= document.getElementById('desktopToggle');
+var cdpStrip       = document.getElementById('cdpStrip');
+var cdpStatus      = document.getElementById('cdpStatus');
+var cdpLaunch      = document.getElementById('cdpLaunch');
 
 function escHtml(s){
   return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
@@ -92,17 +93,15 @@ function isLocalURL(url){
     var u = new URL(url, location.origin);
     if (u.origin !== location.origin) return false;
     var p = u.pathname;
-    return p === '/'
-        || p === '/tabs'
-        || p === '/clones'
-        || p === '/healthz'
+    return p === '/' || p === '/tabs' || p === '/clones' || p === '/healthz'
         || p.indexOf('/clone/') === 0
         || p.indexOf('/clones/') === 0
         || p.indexOf('/static/') === 0
         || p.indexOf('/tool/') === 0
         || p.indexOf('/lynkio/') === 0
         || p.indexOf('/__lynk_') === 0
-        || p.indexOf('/search') === 0;
+        || p.indexOf('/search') === 0
+        || p.indexOf('/cdp/') === 0;
   } catch(e){ return false; }
 }
 function fullURL(url){
@@ -131,7 +130,6 @@ function _copyFallback(text, label){
     showToast(label || 'Copied');
   } catch(e){ showToast('Copy failed'); }
 }
-
 function realURLFromProxied(href){
   try {
     var u = new URL(href, location.origin);
@@ -271,20 +269,16 @@ function isMobileOnlyViewport(){
   } catch(e){}
   return (('ontouchstart' in window) && window.innerWidth < 900);
 }
-
 function applyFrameLayout(){
   var t = activeTab();
   if (!t || !t.frame) return;
   var container = t.frame.parentElement;
   if (!container) return;
-
   var W = container.clientWidth || 400;
   var H = container.clientHeight || 600;
   var z = getZoom();
   var desktop = getDesktopMode();
-
   t.frame.style.transformOrigin = '0 0';
-
   if (desktop && isMobileOnlyViewport()){
     var vpW = DESKTOP_VP_W;
     var fit = W / vpW;
@@ -308,7 +302,6 @@ function applyFrameLayout(){
     }
   }
 }
-
 function setZoom(z){
   z = clamp(z, 0.4, 3);
   z = Math.round(z * 10) / 10;
@@ -363,6 +356,115 @@ function copyActiveURL(){
     text: 'Copied URL: ' + url, src: 'shell.js'
   });
 }
+
+/* ============================================================
+   CDP — real Chrome tab strip + capture
+   ============================================================ */
+var cdpAvailable = false;
+var cdpTabs = [];
+var cdpLastFocused = '';
+
+function renderCdpStatus(s) {
+  if (!cdpStatus) return;
+  if (s.available) {
+    cdpStatus.textContent = '● ' + (s.browser || 'Chrome') + ' · ' + (s.tabs || []).length + ' tab(s)';
+    cdpStatus.style.color = '#10b981';
+  } else {
+    cdpStatus.textContent = s.error ? ('○ ' + s.error) : '○ Chrome not connected';
+    cdpStatus.style.color = '#f87171';
+  }
+}
+function renderCdpStrip(s) {
+  if (!cdpStrip) return;
+  cdpStrip.innerHTML = '';
+  var list = s.tabs || [];
+  if (!s.available) {
+    var msg = document.createElement('span');
+    msg.style.cssText = 'font-size:11.5px;color:#64748b;padding:6px 10px;';
+    msg.textContent = 'Start Chrome / Brave / Edge to enable one-click challenge solving.';
+    cdpStrip.appendChild(msg);
+    return;
+  }
+  list.forEach(function(t){
+    var el = document.createElement('div');
+    el.className = 'cdp-tab' + (t.targetId === cdpLastFocused ? ' active' : '');
+    el.title = t.url;
+    var title = (t.title || t.url || '(untitled)').slice(0, 40);
+    var host = '';
+    try { host = new URL(t.url).hostname; } catch(e) {}
+    el.innerHTML = '<span class="cdp-tab-title">' + escHtml(title) + '</span>'
+                 + '<span class="cdp-tab-url">' + escHtml(host) + '</span>';
+    el.onclick = async function(){
+      cdpLastFocused = t.targetId;
+      try {
+        await fetch('/cdp/focus-tab', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({targetId: t.targetId})
+        });
+      } catch(e){}
+      showToast('Focused real Chrome tab');
+      renderCdpStrip(s);
+    };
+    cdpStrip.appendChild(el);
+  });
+}
+async function refreshCdp() {
+  try {
+    var r = await fetch('/cdp/status', {credentials: 'same-origin'});
+    var s = await r.json();
+    cdpAvailable = !!s.available;
+    cdpTabs = s.tabs || [];
+    renderCdpStatus(s);
+    renderCdpStrip(s);
+  } catch(e) {
+    cdpAvailable = false;
+    renderCdpStatus({available: false, error: 'status fetch failed'});
+    renderCdpStrip({available: false});
+  }
+}
+if (cdpLaunch) {
+  cdpLaunch.onclick = async function(){
+    cdpLaunch.disabled = true;
+    cdpLaunch.textContent = 'Launching…';
+    try {
+      var r = await fetch('/cdp/launch', {method:'POST', credentials:'same-origin'});
+      var j = await r.json();
+      if (j.ok) showToast('Chrome connected');
+      else      showToast('Launch failed: ' + (j.message || '?'));
+      setTimeout(refreshCdp, 1000);
+    } finally {
+      cdpLaunch.disabled = false;
+      cdpLaunch.textContent = 'Launch Chrome';
+    }
+  };
+}
+async function captureFromRealChrome() {
+  if (!cdpAvailable) return null;
+  if (!cdpTabs.length) { showToast('No real Chrome tabs open'); return null; }
+  var t = null;
+  for (var i = 0; i < cdpTabs.length; i++) {
+    if (cdpTabs[i].targetId === cdpLastFocused) { t = cdpTabs[i]; break; }
+  }
+  if (!t) t = cdpTabs[0];
+  showToast('Capturing from Chrome…');
+  try {
+    var r = await fetch('/cdp/capture', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ targetId: t.targetId, url: t.url })
+    });
+    var j = await r.json();
+    if (j.ok && j.uuid) { showToast('Captured: ' + j.uuid); return j; }
+    showToast('Capture failed: ' + (j.error || '?'));
+    return null;
+  } catch(e) {
+    showToast('Capture error: ' + e.message);
+    return null;
+  }
+}
+setInterval(refreshCdp, 5000);
+setTimeout(refreshCdp, 300);
 
 function addTab(url, opts){
   opts = opts || {};
@@ -512,9 +614,7 @@ function reloadActive(){
   var t = activeTab();
   if (!t || !t.frame) return;
   markTabBusy(t);
-  try {
-    t.frame.src = isLocalURL(t.url) ? fullURL(t.url) : proxyURL(t.url);
-  } catch(e){}
+  try { t.frame.src = isLocalURL(t.url) ? fullURL(t.url) : proxyURL(t.url); } catch(e){}
 }
 function stopActive(){
   var t = activeTab();
@@ -667,22 +767,12 @@ urlStar.onclick = function(){
   }
   saveBookmarks(b); updateURLStar(t.url);
 };
-if (urlCopy){
-  urlCopy.onclick = copyActiveURL;
-}
+if (urlCopy) urlCopy.onclick = copyActiveURL;
 document.getElementById('newTab').onclick = function(){ addTab('https://duckduckgo.com'); };
 
-document.getElementById('zoomIn').onclick = function(){
-  setZoom(getZoom() + 0.1);
-};
-document.getElementById('zoomOut').onclick = function(){
-  setZoom(getZoom() - 0.1);
-};
-if (zoomLevelEl){
-  zoomLevelEl.onclick = function(){
-    setZoom(1);
-  };
-}
+document.getElementById('zoomIn').onclick = function(){ setZoom(getZoom() + 0.1); };
+document.getElementById('zoomOut').onclick = function(){ setZoom(getZoom() - 0.1); };
+if (zoomLevelEl) zoomLevelEl.onclick = function(){ setZoom(1); };
 if (desktopToggleEl){
   setDesktopModeRaw(getDesktopMode());
   desktopToggleEl.onclick = function(){
@@ -729,9 +819,7 @@ function addConsole(tabId, level, text, src){
   }
   if (tabId === activeId || !consoleOnlyActive) renderConsole();
   updateConsoleBadge();
-  sendControlPlane('console', {
-    tab_id: tabId, level: level, text: text, src: src,
-  });
+  sendControlPlane('console', { tab_id: tabId, level: level, text: text, src: src });
 }
 function visibleConsoleEntries(){
   var all = [];
@@ -836,9 +924,8 @@ window.addEventListener('message', function(e){
         updateURLStar(real);
       }
     }
-    if (m.title && !(tab.title && tab.title.indexOf('Clone · ') === 0)) {
+    if (m.title && !(tab.title && tab.title.indexOf('Clone · ') === 0))
       tab.title = String(m.title).slice(0,60);
-    }
     markTabIdle(tab);
     renderTabs(); updateNavState(); saveTabs();
   } else if (type === 'lynk:push-state'){
@@ -967,7 +1054,8 @@ document.getElementById('mView').onclick = function(e){
 var mCloneEl = document.getElementById('mClone');
 if (mCloneEl){
   mCloneEl.onclick = async function(){
-    var r = await cloneActivePage();
+    var r = await captureFromRealChrome();
+    if (!r) r = await cloneActivePage();
     if (r && r.uuid) openClone(r.uuid);
   };
 }
@@ -1083,7 +1171,7 @@ function connectLynk(){
     lynk.connect().then(function(){
       lynk.emit('subscribe', {
         tabs: tabs.map(function(t){ return t.id; }),
-        version: 'v18.5',
+        version: 'v20.0',
       });
     }).catch(function(){
       if (wsBadge){ wsBadge.textContent = '· WS ⚠'; wsBadge.style.color = '#f87171'; }
@@ -1159,6 +1247,10 @@ window.__LYNK__ = {
   getDesktopMode:  getDesktopMode,
   applyFrameLayout: applyFrameLayout,
   clonePage:       cloneActivePage,
+  captureFromRealChrome: captureFromRealChrome,
+  refreshCdp:      refreshCdp,
+  cdpAvailable:    function(){ return cdpAvailable; },
+  cdpTabs:         function(){ return cdpTabs; },
   openClone:       openClone,
   listClones:      listClones,
   isLocalURL:      isLocalURL,
