@@ -1,6 +1,4 @@
-/* Lynkio Cloner — capture. Injected into every proxied page.
-   Provides window.lynkCapture() that ships a full state payload to
-   /clone/capture-client. */
+/* Lynkio Cloner — capture. Injected into every proxied page. */
 (function () {
   'use strict';
   if (window.__LYNK_CAPTURE_READY__) return;
@@ -54,6 +52,33 @@
       }
     } catch (e) {}
     return out;
+  }
+
+  /* ---- KEY: sanitize <script> textContent in outer_html ----
+     If a script's textContent contains `</script` (unescaped), the
+     re-parsed clone will close the tag early and dump the rest as
+     visible text. Escaping `</script` to `<\/script` preserves the
+     exact JS string value (since \/ is a valid escape for /) while
+     preventing the closing-tag match. `a </ b` (unusual JS) is not
+     affected because only the literal sequence `</script` matches. */
+  function safeOuterHTML() {
+    try {
+      var clone = document.documentElement.cloneNode(true);
+      var scripts = clone.querySelectorAll('script');
+      for (var i = 0; i < scripts.length; i++) {
+        var sc = scripts[i];
+        var txt = sc.textContent || '';
+        if (txt.indexOf('</') === -1) continue;
+        sc.textContent = txt.replace(/<\/(script)/gi, '<\\/$1');
+      }
+      return '<!DOCTYPE html>\n' + clone.outerHTML;
+    } catch (e) {
+      try {
+        return '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+      } catch (e2) {
+        return '<!DOCTYPE html><html><head></head><body></body></html>';
+      }
+    }
   }
 
   function stablePath(el) {
@@ -177,7 +202,6 @@
       } catch (e) {}
     }
     walkShadow(document, '');
-
     return state;
   }
 
@@ -244,8 +268,7 @@
 
   function captureIndexedDB() {
     if (typeof indexedDB === 'undefined') return Promise.resolve({});
-    if (!indexedDB.databases)
-      return Promise.resolve({ __unsupported: true });
+    if (!indexedDB.databases) return Promise.resolve({ __unsupported: true });
     return indexedDB.databases().then(function (dbs) {
       var out = {};
       var chain = Promise.resolve();
@@ -404,7 +427,7 @@
 
     var payload = {
       target_url: target,
-      outer_html: '<!DOCTYPE html>\n' + document.documentElement.outerHTML,
+      outer_html: safeOuterHTML(),
       local_storage: snapshotStorage(localStorage),
       session_storage: snapshotStorage(sessionStorage),
       document_cookies: document.cookie,
@@ -445,6 +468,4 @@
       }).then(function (r) { return r.json(); });
     });
   };
-
-  console.log('[lynk] capture ready');
 })();
