@@ -277,33 +277,61 @@ def _looks_like_html(body_bytes):
 # Cloudflare challenge detection
 # ======================================================================
 _CF_BODY_SIGNATURES = (
-    b"just a moment",
-    b"cf-challenge",
-    b"challenge-platform",
-    b"checking your browser",
+    b"_cf_chl_opt",
     b"cf_chl_opt",
-    b"__cf_chl",
+    b"cdn-cgi/challenge-platform",
     b"cf-browser-verification",
+    b"cf_challenge",
+    b"just a moment",
+    b"checking your browser",
+    b"challenge-platform",
+    b"__cf_chl",
 )
 
 
 def _is_cf_challenge(status, headers_dict, body):
+    """
+    Detect a Cloudflare challenge. Status is NOT a gate — Managed
+    Challenges are served with HTTP 200 and only the body reveals what
+    they are. The markers below are Cloudflare-internal strings that
+    never appear on a normal page, so any one of them is definitive.
+    """
+    # 1. Documented Cloudflare signal (cheap, definitive)
     try:
         for k, v in headers_dict.items():
             if k.lower() == "cf-mitigated" and str(v).lower() == "challenge":
                 return True
     except Exception:
         pass
-    if status not in (403, 429, 503):
-        return False
+
     if not body:
         return False
-    low = bytes(body[:8192]).lower()
-    for sig in _CF_BODY_SIGNATURES:
-        if sig in low:
-            return True
-    return False
 
+    # 2. Definitive body markers, independent of status code
+    low = bytes(body[:32768]).lower()
+    for marker in (
+        b"_cf_chl_opt",                 # the config object from your error
+        b"cf_chl_opt",                  # variant spelling
+        b"cdn-cgi/challenge-platform",  # orchestrate script URL
+        b"cf-browser-verification",     # legacy interstitial
+        b"cf_challenge",                # generic
+    ):
+        if marker in low:
+            return True
+
+    # 3. Softer signals — must appear together to count
+    if (b"challenge-platform" in low
+            and (b"just a moment" in low or b"checking your browser" in low)):
+        return True
+
+    # 4. Legacy status-only fallback (still useful for older builds)
+    if status in (403, 429, 503):
+        for sig in _CF_BODY_SIGNATURES:
+            if sig in low:
+                return True
+
+    return False
+    
 
 # ======================================================================
 # Google "unusual traffic" detection
@@ -2116,9 +2144,7 @@ def _google_sorry_page(url, origin, attempt_count=0):
 }})();
 </script>
 </body></html>"""
-    return RawResponse(html.encode("utf-8"),
-                       content_type="text/html; charset=utf-8",
-                       status=200)
+    return RawResponse(html.encode("utf-8"), content_type="text/html; charset=utf-8", status=200)
 
 
 # ======================================================================
@@ -2129,7 +2155,66 @@ async def serve_proxied(req, target_url, sid):
     parsed = urlparse(target_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    # ---- CDP PATCH 5: cached capture early-return ----
+    # ---- Cloudflare challenge-platform short-circuit ----
+    # The orchestrate script (/cdn-cgi/challenge-platform/.../chl_page/v1)
+    # reads window._cf_chl_opt, which is only defined inside the challenge
+    # page's own document. Proxying it into a rewritten page produces:
+    #   TypeError: undefined is not an object
+    #   (evaluating 'window._cf_chl_opt.qFyP3=false')
+    # Never proxy the challenge-platform tree. Script forms return an empty
+    # JS stub so the reference resolves; HTML challenge pages hand off to
+    # CDP or the interstitial. Every other asset type under this path gets
+    # a typed stub so the browser doesn't retry.
+    if parsed.path.startswith("/cdn-cgi/challenge-platform/"):
+        wants = _requested_kind(req, target_url)
+        is_script = (
+            wants == "script"
+            or parsed.path.endswith(".js")
+            or "/orchestrate/" in parsed.path
+            or "/scripts/" in parsed.path
+        )
+        if is_script:
+            resp = RawResponse(
+                b"/* lynkio: cloudflare challenge script not proxied */",
+                status=200,
+                content_type="application/javascript; charset=utf-8",
+            )
+            resp.add_header("Cache-Control", "no-store")
+            return resp
+
+        is_html = (
+            wants == "document"
+            or parsed.path.endswith(".html")
+            or "/chl_page/" in parsed.path
+        )
+        if is_html:
+            if cdp_routes.is_available():
+                token = cdp_routes._new_token()
+                asyncio.create_task(cdp_routes._solve_async(
+                    token, target_url, origin, sid,
+                    {"get_session": get_session}))
+                return RawResponse(
+                    cdp_routes.solving_page(target_url, origin, token).encode("utf-8"),
+                    content_type="text/html; charset=utf-8")
+            key = f"{origin}|{target_url}"
+            attempts = int(sess.challenge_attempts.get(key, 0))
+            return _cf_challenge_page(target_url, origin, "cloudflare", attempts)
+
+        # Any other asset type (css, images, fonts) — empty typed stub
+        ext = os.path.splitext(parsed.path.lower())[1]
+        if ext == ".css" or wants == "style":
+            resp = RawResponse(
+                b"/* lynkio: cloudflare challenge asset not proxied */",
+                status=200,
+                content_type="text/css; charset=utf-8",
+            )
+        else:
+            resp = RawResponse(b"", status=204,
+                               content_type="application/octet-stream")
+        resp.add_header("Cache-Control", "no-store")
+        return resp
+
+    # ---- Cached CDP capture early return ----
     _cached_cdp = sess.cdp_captures.pop(target_url, None)
     if _cached_cdp:
         sess.page_origin = origin
@@ -2146,6 +2231,7 @@ async def serve_proxied(req, target_url, sid):
                          f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
         return _resp
 
+    # ---- Self-target guard ----
     if is_self_target(req, target_url):
         recovered = _recover_origin(req, sess)
         if recovered:
@@ -2195,6 +2281,9 @@ async def serve_proxied(req, target_url, sid):
                    and wants in ("document", "data", "")
                    and req.method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"))
 
+    # ================================================================
+    # Stealth branch (curl_cffi)
+    # ================================================================
     if use_stealth:
         jar_cookies = {}
         for c in (jar_cookie or "").split(";"):
@@ -2221,6 +2310,7 @@ async def serve_proxied(req, target_url, sid):
                 except Exception:
                     pass
 
+            # Google "unusual traffic"
             if _is_google_sorry(s_status, s_headers, s_body, s_final_url):
                 log.warning("google sorry on %s (stealth, %d)", target_url, s_status)
                 if cdp_routes.is_available():
@@ -2235,7 +2325,7 @@ async def serve_proxied(req, target_url, sid):
                 attempts = int(sess.challenge_attempts.get(key, 0))
                 return _google_sorry_page(target_url, origin, attempts)
 
-            # ---- CDP PATCH 6: stealth-branch CF handoff ----
+            # Cloudflare challenge — CDP handoff
             if _is_cf_challenge(s_status, s_headers, s_body):
                 log.warning("cloudflare challenge on %s (stealth, %d) — trying CDP",
                             target_url, s_status)
@@ -2251,6 +2341,7 @@ async def serve_proxied(req, target_url, sid):
                 attempts = int(sess.challenge_attempts.get(key, 0))
                 return _cf_challenge_page(target_url, origin, "cloudflare", attempts)
 
+            # Redirect
             if 300 <= s_status < 400:
                 loc = ""
                 for k, v in s_headers_list:
@@ -2297,6 +2388,7 @@ async def serve_proxied(req, target_url, sid):
                     f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
                 return resp
 
+            # Non-HTML data passthrough
             resp_headers = _build_response_headers(s_headers_list,
                                                     is_rewritten=False)
             resp = RawResponse(s_body, status=s_status, content_type=ctype,
@@ -2305,7 +2397,9 @@ async def serve_proxied(req, target_url, sid):
                                      parsed.hostname or "")
             return resp
 
-    # ---- Raw socket path ----
+    # ================================================================
+    # Raw socket path (media, scripts, styles, fallback)
+    # ================================================================
     try:
         reader, writer, status, up_headers, first = \
             await _open_upstream_stream(target_url, req.method,
@@ -2348,6 +2442,7 @@ async def serve_proxied(req, target_url, sid):
     sess.history.append({"url": target_url, "status": status,
                          "method": req.method, "ts": time.time()})
 
+    # ---- HEAD ----
     if req.method == "HEAD":
         await _close_writer(writer)
         resp_headers = _verbatim_response_headers(up_headers)
@@ -2357,9 +2452,9 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
+    # ---- Media ----
     is_binary = _is_media_response(req, target_url, ctype, ext,
                                     status, content_range)
-
     if is_binary:
         resp_headers = _verbatim_response_headers(up_headers)
         resp_headers.setdefault("Content-Type", ctype)
@@ -2400,6 +2495,7 @@ async def serve_proxied(req, target_url, sid):
             headers=resp_headers,
             status=status)
 
+    # ---- 3xx redirects ----
     if 300 <= status < 400:
         loc = _header(up_headers, "location")
         absu = None
@@ -2478,6 +2574,7 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
+    # ---- HLS / M3U8 ----
     is_m3u8 = ("mpegurl" in low_ct
                or "application/vnd.apple" in low_ct
                or path_lower.endswith(".m3u8"))
@@ -2530,6 +2627,7 @@ async def serve_proxied(req, target_url, sid):
 
     is_static_asset = ext in STATIC_EXTS
 
+    # ---- Script stubs (status errors / HTML masquerading as JS) ----
     if wants == "script":
         if status >= 400 or ("text/html" in low_ct or "text/xml" in low_ct
                               or "application/xhtml" in low_ct):
@@ -2569,6 +2667,7 @@ async def serve_proxied(req, target_url, sid):
             _add_cookies_to_response(resp, up_headers, origin_host)
             return resp
 
+    # ---- Style stubs ----
     if wants == "style":
         if status >= 400 or "text/html" in low_ct:
             try:
@@ -2612,6 +2711,7 @@ async def serve_proxied(req, target_url, sid):
             _add_cookies_to_response(resp, up_headers, origin_host)
             return resp
 
+    # ---- HTML (with challenge + google-sorry detection) ----
     if (not is_static_asset) and ("text/html" in low_ct
                                    or "application/xhtml" in low_ct):
         buf = bytearray(); rewritable = True
@@ -2627,6 +2727,7 @@ async def serve_proxied(req, target_url, sid):
 
         raw = bytes(buf)
         hdr_dict = {k: v for k, v in up_headers}
+
         if _is_google_sorry(status, hdr_dict, raw, target_url):
             log.warning("google sorry on %s (raw, %d)", target_url, status)
             if cdp_routes.is_available():
@@ -2641,7 +2742,6 @@ async def serve_proxied(req, target_url, sid):
             attempts = int(sess.challenge_attempts.get(key, 0))
             return _google_sorry_page(target_url, origin, attempts)
 
-        # ---- CDP PATCH 7: raw-branch CF handoff ----
         if _is_cf_challenge(status, hdr_dict, raw):
             log.warning("cloudflare challenge on %s (raw, %d) — trying CDP",
                         target_url, status)
@@ -2694,6 +2794,7 @@ async def serve_proxied(req, target_url, sid):
                                  content_type="text/html; charset=utf-8",
                                  headers=resp_headers, status=status)
 
+    # ---- CSS (non-static) ----
     if (not is_static_asset) and "text/css" in low_ct:
         buf = bytearray(); oversized = False
         try:
@@ -2735,6 +2836,7 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
+    # ---- Default passthrough (data / JSON / anything else) ----
     resp_headers = _build_response_headers(up_headers, is_rewritten=False)
 
     cl_up = _header(up_headers, "content-length")
@@ -2781,6 +2883,7 @@ async def serve_proxied(req, target_url, sid):
 
         raw_bytes = bytes(buf)
         hdr_dict = {k: v for k, v in up_headers}
+
         if _is_google_sorry(status, hdr_dict, raw_bytes, target_url):
             log.warning("google sorry on %s (data)", target_url)
             if cdp_routes.is_available():
@@ -2820,6 +2923,7 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
+    # ---- Oversized / streaming passthrough ----
     head_bytes = bytes(buf)
     resp_headers.pop("Content-Length", None)
     _add_cookies_to_streaming(resp_headers, up_headers, origin_host)
