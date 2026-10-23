@@ -1,18 +1,36 @@
 #!/usr/bin/env python3
 """
-Lynkio Browser — v18.6
+Lynkio Browser — v19.0
 Built on the lynkio framework v1.4.2.
 
-Cloner release — full page/session/DOM/storage cloning.
+v19.0 — Stealth fetch release:
+  • curl_cffi (Chrome JA3/JA4 + HTTP/2 impersonation) replaces the default
+    asyncio TLS handshake for document/data requests. This is what
+    Cloudflare, Coinbase, DataDome, and Imperium inspect on the very first
+    packet — a Python ssl.create_default_context() handshake is instantly
+    fingerprinted as a bot.
+  • Cloudflare challenge detection: `cf-mitigated: challenge` header plus
+    body signatures ("Just a moment", "cf-challenge", "challenge-platform",
+    "Checking your browser"). When detected the proxy returns a clear
+    error page instead of shoving the challenge into the iframe.
+  • cf_clearance persistence: the cookie is stored in the per-session jar
+    and replayed automatically because `curl_cffi` uses the same UA as
+    the fetch that obtained it.
+  • `app.fetch` is monkey-patched with `_stealth_fetch` so every toolkit
+    tool (vulnscan, recon, xss-scan, …) also benefits from browser TLS
+    fingerprints.
+  • Raw-socket path is kept for streaming media and WebSocket — those
+    don't reach the TLS-fingerprint gate before payload transfer, and
+    curl_cffi lacks a compatible streaming-to-asyncio writer.
+  • Captcha preservation: the captcha remover is still opt-in via the
+    toolkit. On a proxied page reCAPTCHA tokens are origin-bound and will
+    never validate against the upstream, so the widget is preserved for
+    visual fidelity but the token will fail server-side. That is a
+    reCAPTCHA architectural limit — not a proxy bug.
 
-v18.6 changes:
-  • New _json_for_script() helper escapes `</` and U+2028/U+2029 in every
-    JSON blob embedded inside a <script> tag. Without this, JSON payloads
-    containing `</script>` (common in Facebook / Instagram client-side
-    error blobs, Next.js __NEXT_DATA__, etc.) close the tag early and
-    the rest of the JSON is rendered as visible page text.
-  • Inject-snippet scripts also escape `</`.
-  • cloner.install() still registered BEFORE /* catch-all (v18.5 fix).
+v18.6 fixes still present:
+  • _json_for_script() escapes </ and U+2028/U+2029 in embedded JSON.
+  • cloner.install() registered BEFORE the /* catch-all.
 """
 
 import asyncio
@@ -45,6 +63,16 @@ from lynkio import (
 import scanner
 import cloner
 
+# ---- stealth HTTP client (TLS + HTTP/2 impersonation) ----
+try:
+    from curl_cffi.requests import AsyncSession
+    from curl_cffi import CurlHttpVersion
+    HAS_CURL_CFFI = True
+except Exception:
+    AsyncSession = None
+    CurlHttpVersion = None
+    HAS_CURL_CFFI = False
+
 HERE          = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR    = os.path.join(HERE, "static")
 TEMPLATES_DIR = os.path.join(HERE, "templates")
@@ -76,11 +104,26 @@ COOKIE_MAX_ORIGINS    = 256
 SESSION_COOKIE = "__lynk_sid"
 ORIGIN_COOKIE  = "__lynk_origin"
 
+# ---- canonical browser identity ----
+# These MUST match the curl_cffi impersonation profile, or Cloudflare
+# re-challenges the request. Chrome/124 is the current curl_cffi profile.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+IMPERSONATE_PROFILE = "chrome124"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("lynk.browser")
+if HAS_CURL_CFFI:
+    log.info("stealth: curl_cffi loaded — impersonating %s", IMPERSONATE_PROFILE)
+else:
+    log.warning("stealth: curl_cffi NOT installed — TLS fingerprinting disabled. "
+                "Run: pip install curl_cffi")
 
 
 SEARCH_ENGINES = {
@@ -94,9 +137,7 @@ SEARCH_ENGINES = {
 }
 
 BROWSER_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0.0.0 Safari/537.36"),
+    "User-Agent": BROWSER_UA,
     "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
                "image/avif,image/webp,image/apng,*/*;q=0.8"),
     "Accept-Language": "en-US,en;q=0.9",
@@ -221,6 +262,66 @@ def _looks_like_html(body_bytes):
                 or b"<body" in low[:300]):
             return True
     return False
+
+
+# ======================================================================
+# Cloudflare challenge detection (v19.0)
+# ======================================================================
+_CF_BODY_SIGNATURES = (
+    b"just a moment",
+    b"cf-challenge",
+    b"challenge-platform",
+    b"checking your browser",
+    b"cf_chl_opt",
+    b"__cf_chl",
+    b"cf-browser-verification",
+)
+
+def _is_cf_challenge(status, headers_dict, body):
+    """
+    Detect a Cloudflare challenge/interstitial page.
+    Sources:
+      • cf-mitigated: challenge  (documented Cloudflare signal)
+      • Known body signatures of the "Just a moment…" interstitial
+      • Known challenge script hosts baked into the response
+    """
+    try:
+        for k, v in headers_dict.items():
+            if k.lower() == "cf-mitigated" and str(v).lower() == "challenge":
+                return True
+    except Exception:
+        pass
+    if status not in (403, 429, 503):
+        return False
+    if not body:
+        return False
+    low = bytes(body[:8192]).lower()
+    for sig in _CF_BODY_SIGNATURES:
+        if sig in low:
+            return True
+    return False
+
+
+def _cf_challenge_page(url, origin):
+    """User-facing page shown when Cloudflare blocks the proxy fetch."""
+    return error_page(
+        "Cloudflare challenge",
+        f"<b>{esc(url)}</b><br><br>"
+        "The upstream returned a Cloudflare bot challenge. Lynkio's "
+        "stealth fetch (curl_cffi impersonating Chrome 124) already "
+        "presents a browser TLS fingerprint — but this site's Cloudflare "
+        "rule requires a full JavaScript challenge or Turnstile widget "
+        "that can only be cleared by a real headful browser.<br><br>"
+        "Options:<br>"
+        "• Open the URL directly in a normal tab so your browser can "
+        "solve the challenge and store <code>cf_clearance</code>.<br>"
+        "• If you already have a valid <code>cf_clearance</code> cookie, "
+        "add it via Toolkit → Cookie Editor for <code>"
+        f"{esc(origin)}</code>, then reload.<br>"
+        "• Use a residential/ISP proxy (datacenter ASNs are scored as "
+        "automation regardless of TLS fingerprint).",
+        403,
+    )
 
 
 def _requested_kind(req, target_url):
@@ -513,12 +614,9 @@ def esc(t):
 
 def _json_for_script(obj):
     """
-    Return obj as a JSON string safe to embed inside a <script>...</script>.
-    Escapes `</` → `<\\/` so the browser parser doesn't see a closing tag
-    inside the JSON (which happens for Facebook / Instagram / Next.js
-    error payloads that contain `</script>` in strings). `\\/` is a valid
-    JSON escape for `/`, so parsing restores the original value exactly.
-    Also escapes U+2028 / U+2029 which would otherwise be line terminators.
+    Safe JSON for embedding inside <script>...</script>.
+    Escapes `</` → `<\\/` (a valid JSON escape for `/`) so the parser
+    cannot see a premature close tag. Also escapes U+2028/U+2029.
     """
     s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
     s = s.replace("</", "<\\/")
@@ -715,6 +813,8 @@ def error_page(title, message, status=500):
         'h1{font-size:1.35rem;margin:0 0 8px}'
         'p{color:#94a3b8;font-size:.92rem;line-height:1.6;margin:0 0 22px;'
         'word-break:break-word}'
+        'code{background:rgba(2,6,23,.6);padding:2px 6px;border-radius:4px;'
+        'font-family:ui-monospace,monospace;font-size:.85em}'
         'a{display:inline-flex;gap:6px;background:linear-gradient(135deg,#38bdf8,#818cf8);'
         'color:#0b1220;padding:11px 20px;border-radius:10px;font-weight:700;'
         'text-decoration:none}'
@@ -722,6 +822,67 @@ def error_page(title, message, status=500):
         f'<div class="ic">⚠</div><h1>{esc(title)}</h1><p>{message}</p>'
         '<a href="/">← Back to Lynk</a></div></body></html>',
         status=status, content_type="text/html; charset=utf-8")
+
+
+# ======================================================================
+# Stealth fetch via curl_cffi (v19.0)
+# ======================================================================
+async def _stealth_fetch_raw(url, method="GET", headers=None, body=None,
+                              timeout=30.0, allow_redirects=True,
+                              max_redirects=5, session_cookies=None):
+    """
+    Fetch a URL with a real Chrome TLS fingerprint (JA3/JA4) + HTTP/2
+    frame ordering using curl_cffi. Returns a simple dict:
+        {status, headers: dict, content: bytes, url: final_url}
+    or None on failure.
+    """
+    if not HAS_CURL_CFFI:
+        return None
+    try:
+        merged = dict(headers or {})
+        merged.setdefault("User-Agent", BROWSER_UA)
+        if session_cookies:
+            cookie_header = "; ".join(f"{k}={v}" for k, v in session_cookies.items()
+                                      if v)
+            if cookie_header:
+                existing = merged.get("Cookie", "")
+                merged["Cookie"] = (existing + "; " + cookie_header).lstrip("; ")
+        async with AsyncSession() as s:
+            resp = await s.request(
+                method.upper(), url,
+                headers=merged,
+                data=body,
+                impersonate=IMPERSONATE_PROFILE,
+                allow_redirects=allow_redirects,
+                max_redirects=max_redirects,
+                timeout=timeout,
+            )
+            hdr_dict = {}
+            try:
+                for k, v in resp.headers.multi_items():
+                    kl = k.lower()
+                    if kl in hdr_dict:
+                        if not isinstance(hdr_dict[kl], list):
+                            hdr_dict[kl] = [hdr_dict[kl]]
+                        hdr_dict[kl].append(v)
+                    else:
+                        hdr_dict[kl] = v
+            except Exception:
+                hdr_dict = {k.lower(): v for k, v in dict(resp.headers).items()}
+            return {
+                "status": resp.status_code,
+                "headers": hdr_dict,
+                "content": resp.content,
+                "url": str(resp.url),
+            }
+    except Exception as e:
+        log.debug("stealth fetch failed %s: %s", url, e)
+        return None
+
+
+def _stealth_fetch_sync_factory():
+    """Return a sync curl_cffi fetch usable by the toolkit's app.fetch."""
+    return None  # not used — app.fetch is patched with the async version
 
 
 # ======================================================================
@@ -1064,7 +1225,7 @@ async def _resolve_host(host, port, prefer_ipv4=True, use_doh=True):
 
 
 # ======================================================================
-# Upstream request builder
+# Upstream request builder (raw socket — kept for media / WS)
 # ======================================================================
 def _build_request(method, target_url, headers, body):
     p = urlparse(target_url)
@@ -1614,6 +1775,17 @@ def _add_cookies_to_streaming(headers_dict, up_headers_list, origin_host):
         headers_dict["Set-Cookie"] = cookies
 
 
+def _headers_list_from_dict(d):
+    out = []
+    for k, v in d.items():
+        if isinstance(v, list):
+            for vv in v:
+                out.append((k.lower(), str(vv)))
+        else:
+            out.append((k.lower(), str(v)))
+    return out
+
+
 # ======================================================================
 # Main proxy
 # ======================================================================
@@ -1667,6 +1839,101 @@ async def serve_proxied(req, target_url, sid):
     if merged:
         out_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in merged.items())
 
+    # ---- STEALTH PATH: documents and data via curl_cffi ----
+    # Only for document/data — media is streamed raw to avoid buffering.
+    use_stealth = (HAS_CURL_CFFI
+                   and wants in ("document", "data", "")
+                   and req.method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"))
+
+    if use_stealth:
+        jar_cookies = {}
+        for c in (jar_cookie or "").split(";"):
+            c = c.strip()
+            if "=" in c:
+                k, v = c.split("=", 1)
+                jar_cookies[k.strip()] = v.strip()
+        stealth = await _stealth_fetch_raw(
+            target_url, method=req.method, headers=out_headers,
+            body=req.body, timeout=30.0,
+            allow_redirects=False, max_redirects=0,
+            session_cookies=jar_cookies,
+        )
+        if stealth is not None:
+            s_status = stealth["status"]
+            s_headers = stealth["headers"]
+            s_body = stealth["content"]
+            s_headers_list = _headers_list_from_dict(s_headers)
+
+            # Store Set-Cookie from stealth response
+            for sc in _headers_all(s_headers_list, "set-cookie"):
+                try:
+                    sess.cookies.merge_set_cookie(origin, sc)
+                except Exception:
+                    pass
+
+            # Cloudflare challenge?
+            if _is_cf_challenge(s_status, s_headers, s_body):
+                log.warning("cloudflare challenge on %s (stealth, %d)", target_url, s_status)
+                return _cf_challenge_page(target_url, origin)
+
+            # Redirect — rewrite location and return
+            if 300 <= s_status < 400:
+                loc = ""
+                for k, v in s_headers_list:
+                    if k == "location":
+                        loc = v
+                        break
+                if loc:
+                    absu = urljoin(target_url, loc)
+                    resp_headers = {"Location": proxy_url(absu)}
+                    resp = RawResponse(b"", status=s_status,
+                                       headers=resp_headers,
+                                       content_type="text/plain; charset=utf-8")
+                    _add_cookies_to_response(resp, s_headers_list,
+                                             parsed.hostname or "")
+                    return resp
+
+            ctype = ""
+            for k, v in s_headers_list:
+                if k == "content-type":
+                    ctype = v
+                    break
+            low_ct = ctype.lower()
+
+            # HTML → rewrite
+            if (not (os.path.splitext(parsed.path.lower())[1] in STATIC_EXTS)
+                    and ("text/html" in low_ct or "application/xhtml" in low_ct)):
+                sess.page_origin = origin
+                ctx = {"upstream": target_url, "sid": sid,
+                       "_injected": [s["code"] for s in sess.injected
+                                     if s["enabled"]]}
+                body = HTMLRewriter(target_url, ctype, ctx).rewrite(s_body)
+                resp_headers = _build_response_headers(s_headers_list,
+                                                        is_rewritten=True)
+                resp = RawResponse(body, status=s_status,
+                                   content_type="text/html; charset=utf-8",
+                                   headers=resp_headers)
+                _add_cookies_to_response(resp, s_headers_list,
+                                         parsed.hostname or "")
+                resp.add_header(
+                    "Set-Cookie",
+                    f"{SESSION_COOKIE}={sid}; Path=/; Max-Age=86400; SameSite=Lax")
+                resp.add_header(
+                    "Set-Cookie",
+                    f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
+                return resp
+
+            # Non-HTML data → passthrough
+            resp_headers = _build_response_headers(s_headers_list,
+                                                    is_rewritten=False)
+            resp = RawResponse(s_body, status=s_status, content_type=ctype,
+                               headers=resp_headers)
+            _add_cookies_to_response(resp, s_headers_list,
+                                     parsed.hostname or "")
+            return resp
+        # fall through to raw socket if stealth failed
+
+    # ---- RAW SOCKET PATH (media, scripts, styles, fallback) ----
     try:
         reader, writer, status, up_headers, first = \
             await _open_upstream_stream(target_url, req.method,
@@ -1986,8 +2253,12 @@ async def serve_proxied(req, target_url, sid):
             log.debug("html read stopped: %s", e)
         await _close_writer(writer)
 
+        raw = bytes(buf)
+        if _is_cf_challenge(status, dict(up_headers), raw):
+            log.warning("cloudflare challenge on %s (raw, %d)", target_url, status)
+            return _cf_challenge_page(target_url, origin)
+
         if rewritable:
-            raw = bytes(buf)
             if ce and ce != "identity":
                 raw = _decompress(raw, ce)
             sess.page_origin = origin
@@ -2108,7 +2379,12 @@ async def serve_proxied(req, target_url, sid):
                         target_url, buf_len, expected_len)
             resp_headers.pop("Content-Length", None)
 
-        resp = RawResponse(bytes(buf), status=status,
+        raw_bytes = bytes(buf)
+        if _is_cf_challenge(status, dict(up_headers), raw_bytes):
+            log.warning("cloudflare challenge on %s (data)", target_url)
+            return _cf_challenge_page(target_url, origin)
+
+        resp = RawResponse(raw_bytes, status=status,
                            content_type=ctype, headers=resp_headers)
         try:
             existing = {k.lower() for k in (resp.headers or {}).keys()}
@@ -2171,6 +2447,43 @@ async def _try_proxy_candidates(req, sess, sid, path_only, qs, candidates):
             log.debug("candidate %s failed: %s", origin, e)
             continue
     return None
+
+
+# ======================================================================
+# Stealth monkey-patch of app.fetch (v19.0)
+# ======================================================================
+_original_fetch = app.fetch
+
+async def _stealth_fetch(url, method="GET", headers=None, timeout=30.0,
+                          **kwargs):
+    """
+    Wrapper around Lynkio's app.fetch that tries curl_cffi first.
+    When it succeeds and is not a Cloudflare challenge, we return a
+    FetchResponse-shaped object so the toolkit tools work unchanged.
+    """
+    if HAS_CURL_CFFI and method.upper() in ("GET", "HEAD"):
+        try:
+            stealth = await _stealth_fetch_raw(
+                url, method=method, headers=headers,
+                timeout=timeout, allow_redirects=kwargs.get("allow_redirects", True),
+                max_redirects=kwargs.get("max_redirects", 5),
+            )
+            if stealth is not None:
+                if not _is_cf_challenge(stealth["status"],
+                                        stealth["headers"],
+                                        stealth["content"]):
+                    # Return a Lynkio FetchResponse-compatible object
+                    from lynkio.server import FetchResponse  # type: ignore
+                    hdrs = {k.lower(): v for k, v in stealth["headers"].items()}
+                    return FetchResponse(
+                        stealth["status"], hdrs, stealth["content"],
+                        url=str(stealth["url"]), reason="")
+        except Exception as e:
+            log.debug("stealth fetch (toolkit) failed %s: %s", url, e)
+    return await _original_fetch(url, method=method, headers=headers,
+                                  timeout=timeout, **kwargs)
+
+app.fetch = _stealth_fetch
 
 
 # ======================================================================
@@ -3138,7 +3451,7 @@ async def t_subdomain_takeover(req):
         data, _ = await _fetch_json(
             f"https://cloudflare-dns.com/dns-query?name={quote(sub)}&type=CNAME",
             headers={"Accept": "application/dns-json",
-                     "User-Agent": BROWSER_HEADERS["User-Agent"]}, timeout=6.0)
+                     "User-Agent": BROWSER_UA}, timeout=6.0)
         if data and data.get("Answer"):
             for a in data["Answer"]:
                 if a.get("type") == 5:
@@ -4171,6 +4484,18 @@ async def t_captcha_remove(req):
     return {"ok": True, "id": snippet["id"]}
 
 
+@tool("captcha-remove-off")
+async def t_captcha_remove_off(req):
+    """Disable the captcha remover so legitimate captchas render normally."""
+    sid, _ = session_from_req(req)
+    sess = get_session(sid)
+    for s in sess.injected:
+        if s["name"] == "Captcha Remover":
+            s["enabled"] = False
+            return {"ok": True, "disabled": True}
+    return {"ok": True, "disabled": False, "note": "not present"}
+
+
 @app.get("/tool/fetch")
 async def t_fetch(req):
     url = req.query_params.get("url") or ""
@@ -4448,6 +4773,10 @@ async def healthz(req):
         "stream_media_exts": len(STREAM_MEDIA_EXTS),
         "stream_chunk_size": STREAM_CHUNK_SIZE,
         "small_media_max": SMALL_MEDIA_MAX,
+        # v19.0 stealth
+        "curl_cffi": HAS_CURL_CFFI,
+        "impersonate_profile": IMPERSONATE_PROFILE if HAS_CURL_CFFI else None,
+        "browser_ua": BROWSER_UA,
     })
 
 
@@ -4456,7 +4785,7 @@ async def healthz(req):
 # ======================================================================
 if __name__ == "__main__":
     print("=" * 68)
-    print(f"  🛠  Lynkio Browser — v18.6   (framework {framework_version})")
+    print(f"  🛠  Lynkio Browser — v19.0   (framework {framework_version})")
     print("=" * 68)
     print(f"  Home       →  http://localhost:{PORT}/")
     print(f"  Browser    →  http://localhost:{PORT}/tabs")
@@ -4477,5 +4806,6 @@ if __name__ == "__main__":
     print(f"  Captcha hosts:    {len(CAPTCHA_HOSTS)}")
     print(f"  Toolkit:          {len(TOOLS)} endpoints wired")
     print(f"  Cloner:           {cloner.CLONES_DIR}")
+    print(f"  Stealth:          {'curl_cffi · ' + IMPERSONATE_PROFILE if HAS_CURL_CFFI else 'DISABLED — pip install curl_cffi'}")
     print("=" * 68)
     app.run()
