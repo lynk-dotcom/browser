@@ -1,4 +1,4 @@
-/* Lynkio Cloner — hydrate. Runs in the clone page, BEFORE app scripts. */
+/* Lynkio Cloner — hydrate. Runs in the clone page BEFORE app scripts. */
 (function () {
   'use strict';
   if (window.__LYNK_HYDRATE_READY__) return;
@@ -34,20 +34,32 @@
     });
   }
 
-  var S = window.__LYNK_CLONE_STATE__;
+  /* ---- 1. Read state ---- */
+  var S = null;
+  var stateEl = document.getElementById('__lynk_clone_state');
+  if (stateEl) {
+    try {
+      S = JSON.parse(stateEl.textContent || '{}');
+    } catch (e) {
+      console.error('[lynk] failed to parse inline state:', e && e.message);
+    }
+  }
   if (!S && window.__LYNK_CLONE_STATE_URL__) {
     try {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', window.__LYNK_CLONE_STATE_URL__, false);
       xhr.send(null);
       if (xhr.status === 200) S = JSON.parse(xhr.responseText);
-    } catch (e) { console.error('[lynk] state fetch failed', e); }
+    } catch (e) {
+      console.error('[lynk] state fetch failed:', e && e.message);
+    }
   }
   if (!S) {
-    console.error('[lynk] no clone state; hydration skipped');
+    console.warn('[lynk] no clone state — running without hydration');
     return;
   }
 
+  /* ---- 2. Sync restores ---- */
   if (S.globals) {
     for (var gk in S.globals) {
       try { window[gk] = S.globals[gk]; } catch (e) {}
@@ -72,6 +84,7 @@
     }
   }
 
+  /* ---- 3. IndexedDB barrier ---- */
   var IDB_OPEN = IDBFactory.prototype.open;
   var HYDRATION = hydrateAsync(S);
   window.__LYNK_HYDRATED__ = HYDRATION;
@@ -81,35 +94,27 @@
     var args = version !== undefined ? [name, version] : [name];
     var realReq = null;
     var pending = { success: [], error: [], upgradeneeded: [], blocked: [] };
-
     var proxy = {
       readyState: 'pending',
       get result() { return realReq ? realReq.result : undefined; },
       get error() { return realReq ? realReq.error : null; },
       get source() { return realReq ? realReq.source : null; },
       get transaction() { return realReq ? realReq.transaction : null; },
-      addEventListener: function (t, fn) {
-        if (pending[t]) pending[t].push(fn);
-      },
+      addEventListener: function (t, fn) { if (pending[t]) pending[t].push(fn); },
       removeEventListener: function (t, fn) {
         var l = pending[t]; if (!l) return;
         var i = l.indexOf(fn); if (i >= 0) l.splice(i, 1);
       },
       dispatchEvent: function () { return false; },
     };
-
     ['onsuccess', 'onerror', 'onupgradeneeded', 'onblocked'].forEach(function (prop) {
       var val = null;
       Object.defineProperty(proxy, prop, {
         get: function () { return val; },
-        set: function (fn) {
-          val = fn;
-          if (realReq) realReq[prop] = fn;
-        },
+        set: function (fn) { val = fn; if (realReq) realReq[prop] = fn; },
         configurable: true,
       });
     });
-
     HYDRATION.then(function () {
       realReq = IDB_OPEN.apply(factory, args);
       ['success', 'error', 'upgradeneeded', 'blocked'].forEach(function (type) {
@@ -124,13 +129,11 @@
         };
       });
     });
-
     return proxy;
   };
 
   function hydrateAsync(state) {
     var p = Promise.resolve();
-
     p = p.then(function () {
       if (!state.indexeddb || state.indexeddb.__unsupported) return;
       var names = Object.keys(state.indexeddb);
@@ -147,7 +150,6 @@
       });
       return chain;
     });
-
     p = p.then(function () {
       if (!state.caches || typeof caches === 'undefined') return;
       var names = Object.keys(state.caches);
@@ -168,8 +170,7 @@
                     try { headers.append(kv[0], kv[1]); } catch (e) {}
                   });
                   var response = new Response(body, {
-                    status: entry.status || 200,
-                    headers: headers,
+                    status: entry.status || 200, headers: headers,
                   });
                   return cache.put(entry.url, response);
                 } catch (e) {}
@@ -183,24 +184,20 @@
       });
       return chain;
     });
-
     p = p.then(function () {
-      if (!state.opfs || !navigator.storage || !navigator.storage.getDirectory)
-        return;
+      if (!state.opfs || !navigator.storage || !navigator.storage.getDirectory) return;
       return navigator.storage.getDirectory().then(function (root) {
         return restoreOPFS(root, state.opfs);
       }).catch(function (e) { console.warn('[lynk] OPFS restore failed:', e); });
     });
-
     return p;
   }
 
   function restoreIDB(name, dump) {
     return new Promise(function (resolve, reject) {
       var openReq;
-      try {
-        openReq = IDB_OPEN.call(indexedDB, name, dump.version);
-      } catch (e) { reject(e); return; }
+      try { openReq = IDB_OPEN.call(indexedDB, name, dump.version); }
+      catch (e) { reject(e); return; }
       openReq.onupgradeneeded = function (ev) {
         var db = ev.target.result;
         Object.keys(dump.stores || {}).forEach(function (storeName) {
@@ -218,8 +215,7 @@
             try {
               if (!store.indexNames.contains(idx.name)) {
                 store.createIndex(idx.name, idx.keyPath, {
-                  unique: !!idx.unique,
-                  multiEntry: !!idx.multiEntry,
+                  unique: !!idx.unique, multiEntry: !!idx.multiEntry,
                 });
               }
             } catch (e) {}
@@ -233,7 +229,6 @@
         var tx;
         try { tx = db.transaction(stores, 'readwrite'); }
         catch (e) { try { db.close(); } catch (_) {} reject(e); return; }
-
         var pending = [];
         stores.forEach(function (storeName) {
           var meta = dump.stores[storeName];
@@ -285,7 +280,6 @@
 
   function applyDOMState() {
     var dom = S.dom_state || {};
-
     (dom.forms || []).forEach(function (f) {
       try {
         var el = f.path ? document.querySelector(f.path) : null;
@@ -311,7 +305,6 @@
         }
       } catch (e) {}
     });
-
     (dom.scrolls || []).forEach(function (s) {
       try {
         var el = s.path ? document.querySelector(s.path)
@@ -321,7 +314,6 @@
         el.scrollLeft = s.scrollLeft || 0;
       } catch (e) {}
     });
-
     (dom.canvases || []).forEach(function (c) {
       try {
         var el = c.path ? document.querySelector(c.path) : null;
@@ -331,15 +323,13 @@
         var img = new Image();
         img.onload = function () {
           try {
-            el.width = img.width;
-            el.height = img.height;
+            el.width = img.width; el.height = img.height;
             ctx.drawImage(img, 0, 0);
           } catch (e) {}
         };
         img.src = c.dataUrl;
       } catch (e) {}
     });
-
     (dom.media || []).forEach(function (m) {
       try {
         var el = m.path ? document.querySelector(m.path) : null;
@@ -350,14 +340,10 @@
           try { el.currentTime = m.currentTime; } catch (e) {}
         }
         if (!m.paused) {
-          var playPromise = el.play();
-          if (playPromise && playPromise.catch) playPromise.catch(function () {});
-        } else {
-          try { el.pause(); } catch (e) {}
-        }
+          var pp = el.play(); if (pp && pp.catch) pp.catch(function () {});
+        } else { try { el.pause(); } catch (e) {} }
       } catch (e) {}
     });
-
     (dom.shadows || []).forEach(function (sh) {
       try {
         var parts = (sh.hostPath || '').split(' >> ');
@@ -367,9 +353,7 @@
         } else if (parts.length > 1) {
           host = document.querySelector(parts[0]);
           for (var i = 1; i < parts.length && host; i++) {
-            host = host.shadowRoot
-              ? host.shadowRoot.querySelector(parts[i])
-              : null;
+            host = host.shadowRoot ? host.shadowRoot.querySelector(parts[i]) : null;
           }
         }
         if (!host) return;
@@ -378,17 +362,13 @@
       } catch (e) {}
     });
   }
-
   function scheduleDOMRestore() {
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', applyDOMState, { once: true });
     } else {
       applyDOMState();
     }
-    window.addEventListener('load', function () {
-      applyDOMState();
-    }, { once: true });
-
+    window.addEventListener('load', function () { applyDOMState(); }, { once: true });
     try {
       var pending = false;
       var obs = new MutationObserver(function () {
@@ -396,12 +376,8 @@
         pending = true;
         setTimeout(function () { pending = false; applyDOMState(); }, 60);
       });
-      obs.observe(document.documentElement, {
-        subtree: true, childList: true,
-      });
+      obs.observe(document.documentElement, { subtree: true, childList: true });
     } catch (e) {}
   }
-
   scheduleDOMRestore();
-  console.log('[lynk] hydrate ready (' + S.uuid + ')');
 })();
