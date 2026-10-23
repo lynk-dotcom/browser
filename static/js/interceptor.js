@@ -1,8 +1,10 @@
 /* Lynkio interceptor — injected into every proxied page AND runs on
-   /clone/<uuid> pages (because the clone HTML contains this same script
-   tag). Rewrites URLs at the property level, bridges console / errors /
-   network to the shell, tunnels WebSocket and EventSource through the
-   proxy. Never touches captcha / challenge hosts. */
+   /clone/<uuid> pages. Bridges console / errors / network to the shell,
+   tunnels WebSocket and EventSource through the proxy.
+
+   v18.6: console payloads are truncated to 4 KB before bridging so huge
+   error blobs (e.g. Facebook's client-side error reporting) don't flood
+   the shell console drawer. */
 (function(){
 if (window.__LYNK_ICPT__) return;
 window.__LYNK_ICPT__ = true;
@@ -15,6 +17,7 @@ if (!UP) return;
 var ORIGIN = location.origin;
 var PROXY  = ORIGIN + '/proxy';
 var WS_TUN = ORIGIN.replace(/^http/, 'ws') + '/__lynk_ws';
+var CONSOLE_MAX_LEN = 4096;
 
 var CAPTCHA_HOSTS = [
   'google.com/recaptcha/',
@@ -47,6 +50,18 @@ function post(type, payload){
     window.parent.postMessage(msg, '*');
   } catch(e){}
 }
+function truncateArg(a){
+  var s;
+  if (typeof a === 'string') s = a;
+  else if (a instanceof Error) s = a.message + (a.stack ? '\n' + a.stack : '');
+  else { try { s = JSON.stringify(a); } catch(e){ s = String(a); } }
+  if (typeof s !== 'string') s = String(s);
+  if (s.length > CONSOLE_MAX_LEN){
+    return s.slice(0, CONSOLE_MAX_LEN) + ' …[truncated ' + (s.length - CONSOLE_MAX_LEN) + ' chars]';
+  }
+  return s;
+}
+
 window.addEventListener('beforeunload', function(){ post('nav-start'); });
 window.addEventListener('pagehide',     function(){ post('nav-start'); });
 window.addEventListener('load',         function(){ post('nav-loaded', { title: document.title }); });
@@ -69,11 +84,7 @@ document.addEventListener('submit', function(){ post('nav-start'); }, true);
   if (!orig) return;
   console[level] = function(){
     try {
-      var args = Array.prototype.slice.call(arguments).map(function(a){
-        if (typeof a === 'string') return a;
-        if (a instanceof Error)    return a.message + (a.stack ? '\n' + a.stack : '');
-        try { return JSON.stringify(a); } catch(e){ return String(a); }
-      });
+      var args = Array.prototype.slice.call(arguments).map(truncateArg);
       post('console', { level: level, args: args });
     } catch(e){}
     try { return orig.apply(console, arguments); } catch(e){}
@@ -81,18 +92,18 @@ document.addEventListener('submit', function(){ post('nav-start'); }, true);
 });
 window.addEventListener('error', function(e){
   post('error', {
-    message: e.message || String(e.error || 'Error'),
+    message: truncateArg(e.message || String(e.error || 'Error')),
     source:  e.filename,
     line:    e.lineno,
     col:     e.colno,
-    stack:   e.error && e.error.stack,
+    stack:   e.error && truncateArg(e.error.stack || ''),
   });
 });
 window.addEventListener('unhandledrejection', function(e){
   var r = e.reason || {};
   post('error', {
-    message: 'Unhandled rejection: ' + (r.message || String(r)),
-    stack:   r.stack,
+    message: truncateArg('Unhandled rejection: ' + (r.message || String(r))),
+    stack:   r.stack && truncateArg(r.stack),
   });
 });
 
