@@ -91,6 +91,17 @@ def launch(profile_dir, force_port=None):
     if not exe:
         return False, 0, "Chrome / Chromium / Brave / Edge not found. Install one to enable CDP mode.", None
 
+    # Detect the snap shim trap on Ubuntu bases
+    try:
+        if os.path.islink(exe):
+            target = os.path.realpath(exe)
+            if "/snap/" in target:
+                return (False, 0,
+                        f"{exe} is a snap stub → {target}. Snap does not work in Docker. "
+                        f"Install Debian chromium or google-chrome-stable instead.", None)
+    except Exception:
+        pass
+
     port = force_port
     if port is None:
         for p in DEBUG_PORTS:
@@ -98,35 +109,84 @@ def launch(profile_dir, force_port=None):
                 port = p
                 break
     if port is None:
-        return False, 0, "All debug ports 9222-9242 in use. Close another debug-enabled browser.", None
+        return False, 0, "All debug ports 9222-9242 in use.", None
 
     os.makedirs(profile_dir, exist_ok=True)
+
+    # Writable HOME is required by Chromium's crashpad handler.
+    home = os.environ.get("HOME") or "/tmp"
+    try:
+        os.makedirs(home, exist_ok=True)
+    except Exception:
+        home = "/tmp"
+
+    env = dict(os.environ)
+    env["HOME"] = home
+
+    # Required in containers. --headless=new forced unless explicitly disabled.
+    headless = os.environ.get("CDP_HEADLESS", "1") != "0"
     args = [
         exe,
         f"--remote-debugging-port={port}",
+        f"--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={profile_dir}",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
         "--no-first-run",
         "--no-default-browser-check",
-        "about:blank",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-translate",
+        "--disable-extensions",
+        "--mute-audio",
+        "--remote-allow-origins=*",
     ]
-    kwargs = {}
+    if headless:
+        args.append("--headless=new")
+    args.append("about:blank")
+
+    kwargs = {"env": env,
+              "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL}
     if platform.system() == "Windows":
         kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
 
     try:
-        proc = subprocess.Popen(
-            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        proc = subprocess.Popen(args, **kwargs)
     except Exception as e:
         return False, 0, f"Launch failed: {e}", None
 
-    deadline = time.time() + 20.0
+    log.info("chrome: spawned pid=%s exe=%s port=%s headless=%s",
+             proc.pid, exe, port, headless)
+
+    # Wait for /json/version to actually answer.
+    deadline = time.time() + 30.0   # bumped from 20 → 30 for cold containers
+    last_state = "no response"
     while time.time() < deadline:
+        if proc.poll() is not None:
+            return (False, port,
+                    f"Chromium exited early (code {proc.returncode}). "
+                    f"Common in Docker: missing --no-sandbox or --headless. "
+                    f"Run `docker run --rm <image> {exe} "
+                    f"--remote-debugging-port=9222 --no-sandbox --headless=new "
+                    f"--user-data-dir=/tmp/x about:blank` to see the stderr.",
+                    proc)
         if _port_open(port):
             info = _cdp_version(port)
             if info and "Browser" in info:
                 return True, port, f"Launched {info.get('Browser','?')} on :{port}", proc
-        time.sleep(0.3)
+            last_state = "port open, /json/version invalid"
+        else:
+            last_state = "port closed"
+        time.sleep(0.4)
 
-    return False, port, "Browser launched but CDP didn't respond within 20s", proc
+    return (False, port,
+            f"Chromium process alive (pid {proc.pid}) but :{port} never opened. "
+            f"Last state: {last_state}. Check `docker logs` for Chromium stderr; "
+            f"the container may lack shared libraries.",
+            proc)

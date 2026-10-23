@@ -1,38 +1,37 @@
-FROM python:3.11-slim
-# Prevent Python from buffering logs
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-# Install Chromium and required system dependencies
+FROM python:3.12-slim-bookworm
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromium \
-    chromium-driver \
-    ca-certificates \
-    fonts-liberation \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libgbm1 \
-    libasound2 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libxshmfence1 \
-    libxss1 \
-    libgtk-3-0 \
+        chromium \
+        chromium-common \
+        fonts-liberation \
+        ca-certificates \
+        tini \
+        libnss3 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
+        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+        libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
     && rm -rf /var/lib/apt/lists/*
-# Set the application directory
+
+# Sanity check: fail the build if chromium is a snap shim or broken
+RUN file /usr/bin/chromium | grep -q ELF \
+    && /usr/bin/chromium --version
+
+ENV HOME=/tmp \
+    CDP_HEADLESS=1 \
+    CHROME_BIN=/usr/bin/chromium \
+    PORT=8080 \
+    DEFAULT_SEARCH_ENGINE=ddg \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-# Copy requirements first for better build caching
 COPY requirements.txt .
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
-# Copy application files
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-# Set Chromium executable path
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMIUM_PATH=/usr/bin/chromium
-# Change app.py to your application's entry-point filename
-CMD ["python", "brow.py"]
+
+RUN useradd -u 10001 -M -s /sbin/nologin lynk \
+    && mkdir -p /app/.lynkio-chrome /tmp/.lynkio-chrome \
+    && chown -R lynk:lynk /app /tmp
+
+USER lynk
+EXPOSE 8080
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python3", "brow.py"]
