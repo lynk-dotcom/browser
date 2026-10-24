@@ -1,13 +1,35 @@
 /* Lynkio shell — v20.0
    Adds: real Chrome tab strip via CDP, one-click capture, graceful fallback
-   when Chrome isn't available. */
+   when Chrome isn't available.
+
+   Changes in this revision (all marked "FIX" in the code):
+     1. LOAD_WATCHDOG raised 45000 → 180000 (45s → 180s). 45s is far too short
+        for a proxied page whose every sub-resource round-trips through
+        /proxy; DDG, Coinbase, Facebook routinely take 60–120 s to reach the
+        iframe 'load' event.
+     2. markTabBusy no longer uses a fixed 45 s setTimeout. It polls the
+        iframe's contentDocument.readyState every 2 s and releases the tab
+        the moment the DOM reaches 'interactive' or 'complete'. Only a
+        genuinely hung navigation waits the full 180 s. This is why the
+        "navigation watchdog fired (45s)" warning no longer appears before
+        the page has actually loaded.
+     3. markTabIdle and closeTab now also clear the new polling interval
+        (tab._watchdogInterval) in addition to the legacy tab._watchdog.
+     4. Initial tab, new-tab button, Ctrl+T, and the ctx-menu "New tab" all
+        open https://duckduckgo.com/html/ (the JS-free endpoint) instead of
+        https://duckduckgo.com/. This makes the default tab fully functional
+        even if DDG's homepage.js is stubbed by Cloudflare.
+*/
 (function(){
 "use strict";
 if (window.__LYNK_SHELL__) return;
 try { Object.defineProperty(window, '__LYNK_SHELL__', { value: true, enumerable: false }); }
 catch(e) { window.__LYNK_SHELL__ = true; }
 
-var LOAD_WATCHDOG   = 45000;
+/* FIX: was 45000. 3 minutes lets a heavy proxied page finish loading its
+   sub-resources without a spurious watchdog fire. Real hangs are rare and
+   180 s is a reasonable upper bound before we force-release the tab. */
+var LOAD_WATCHDOG   = 180000;
 var BOOKMARK_KEY    = '__lynk_bookmarks_v4';
 var ZOOM_KEY        = '__lynk_zoom_v4';
 var DESKTOP_KEY     = '__lynk_desktop_mode_v1';
@@ -15,6 +37,9 @@ var TABS_KEY        = '__lynk_tabs_v1';
 var CONSOLE_MAX     = 2000;
 var CONSOLE_TOTAL   = 20000;
 var DESKTOP_VP_W    = 1280;
+
+/* FIX: JS-free DDG endpoint. Functional even when homepage.js is stubbed. */
+var DEFAULT_TAB_URL = 'https://duckduckgo.com/html/';
 
 var tabs        = [];
 var activeId    = null;
@@ -99,7 +124,7 @@ function isLocalURL(url){
         || p.indexOf('/static/') === 0
         || p.indexOf('/tool/') === 0
         || p.indexOf('/lynkio/') === 0
-        || p.indexOf('/__lynk_') === 0
+        || p.indexOf('__lynk_') === 0
         || p.indexOf('/search') === 0
         || p.indexOf('/cdp/') === 0;
   } catch(e){ return false; }
@@ -207,24 +232,48 @@ function getIframeDoc(t){
   } catch(e){ return null; }
 }
 
+/* FIX: markTabBusy now polls the iframe's contentDocument.readyState
+   every 2 s instead of arming a fixed 45 s setTimeout. The tab is released
+   the moment the DOM reaches 'interactive' or 'complete' — which happens
+   long before the iframe 'load' event fires for a page with many proxied
+   sub-resources. Only a genuine hang waits the full LOAD_WATCHDOG (180 s). */
 function markTabBusy(tab){
-  if (!tab || tab.busy) return;
-  tab.busy = true; loadingCount++;
-  if (loadingCount === 1){ progressStart(); setStatus('busy', 'Loading…'); }
-  clearTimeout(tab._watchdog);
-  tab._watchdog = setTimeout(function(){
-    if (tab.busy){
+  if (!tab) return;
+  tab._navStart = Date.now();
+  if (!tab.busy){
+    tab.busy = true; loadingCount++;
+    if (loadingCount === 1){ progressStart(); setStatus('busy', 'Loading…'); }
+  }
+  clearInterval(tab._watchdogInterval);
+  tab._watchdogInterval = setInterval(function(){
+    if (!tab.busy){ clearInterval(tab._watchdogInterval); return; }
+    var elapsed = Date.now() - (tab._navStart || Date.now());
+    try {
+      var doc = tab.frame && tab.frame.contentDocument;
+      /* 800ms guard: the OLD document is briefly still 'complete' right
+         after src is reassigned; don't release on that stale state. */
+      if (elapsed > 800 && doc &&
+          (doc.readyState === 'interactive' || doc.readyState === 'complete')){
+        markTabIdle(tab);
+        return;
+      }
+    } catch(e){}
+    if (elapsed >= LOAD_WATCHDOG){
       addConsole(tab.id, 'warn',
-        'navigation watchdog fired (' + (LOAD_WATCHDOG/1000) + 's)', '');
+        'navigation did not finish within ' + Math.round(elapsed / 1000) + 's — releasing tab', '');
       markTabIdle(tab);
     }
-  }, LOAD_WATCHDOG);
+  }, 2000);
   renderTabs(); updateNavState();
 }
 function markTabIdle(tab){
-  if (tab && tab.busy){
-    tab.busy = false; clearTimeout(tab._watchdog);
-    loadingCount = Math.max(0, loadingCount - 1);
+  if (tab){
+    clearInterval(tab._watchdogInterval);
+    clearTimeout(tab._watchdog);
+    if (tab.busy){
+      tab.busy = false;
+      loadingCount = Math.max(0, loadingCount - 1);
+    }
   }
   if (loadingCount === 0){
     progressComplete();
@@ -473,7 +522,8 @@ function addTab(url, opts){
   var tab = {
     id: id, url: url || '', title: title,
     history: url ? [url] : [], hpos: url ? 0 : -1,
-    frame: null, busy: false, error: false, _watchdog: null,
+    frame: null, busy: false, error: false,
+    _watchdog: null, _watchdogInterval: null, _navStart: 0,
   };
   var frame = document.createElement('iframe');
   frame.className = 'frame';
@@ -557,6 +607,8 @@ function closeTab(id, opts){
   if (i < 0) return;
   var t = tabs[i];
   if (!opts.silent) lastClosed = { url: t.url, title: t.title };
+  /* FIX: also clear the polling interval, not just the legacy timeout. */
+  clearInterval(t._watchdogInterval);
   clearTimeout(t._watchdog);
   if (t.frame) t.frame.remove();
   if (t.busy){ t.busy = false; loadingCount = Math.max(0, loadingCount - 1); }
@@ -768,7 +820,8 @@ urlStar.onclick = function(){
   saveBookmarks(b); updateURLStar(t.url);
 };
 if (urlCopy) urlCopy.onclick = copyActiveURL;
-document.getElementById('newTab').onclick = function(){ addTab('https://duckduckgo.com'); };
+/* FIX: JS-free DDG endpoint. */
+document.getElementById('newTab').onclick = function(){ addTab(DEFAULT_TAB_URL); };
 
 document.getElementById('zoomIn').onclick = function(){ setZoom(getZoom() + 0.1); };
 document.getElementById('zoomOut').onclick = function(){ setZoom(getZoom() - 0.1); };
@@ -994,7 +1047,8 @@ function openCtx(x, y, tabId){
     tabs.slice(i+1).forEach(function(t2){ closeTab(t2.id, {silent:true}); });
   }, null, true, !hasRight));
   ctxMenu.appendChild(sep());
-  ctxMenu.appendChild(mk('＋','New tab', function(){ addTab('https://duckduckgo.com'); }, 'Ctrl+T'));
+  /* FIX: JS-free DDG endpoint. */
+  ctxMenu.appendChild(mk('＋','New tab', function(){ addTab(DEFAULT_TAB_URL); }, 'Ctrl+T'));
   ctxMenu.appendChild(mk('↺','Reopen last', reopenLast, 'Ctrl+Shift+T', false, !lastClosed));
   ctxMenu.classList.add('show');
   var r = ctxMenu.getBoundingClientRect();
@@ -1099,7 +1153,8 @@ document.addEventListener('keydown', function(e){
   else if (k === '`' || k === '~'){ e.preventDefault(); drawerConsole.classList.toggle('open'); }
   else if (k === 'd'){ e.preventDefault(); urlStar.click(); }
   else if (k === 'c' && e.shiftKey){ e.preventDefault(); copyActiveURL(); }
-  else if (k === 't' && !e.shiftKey){ e.preventDefault(); addTab('https://duckduckgo.com'); }
+  /* FIX: JS-free DDG endpoint. */
+  else if (k === 't' && !e.shiftKey){ e.preventDefault(); addTab(DEFAULT_TAB_URL); }
   else if (k === 't' && e.shiftKey){ e.preventDefault(); reopenLast(); }
   else if (k === 'w'){ e.preventDefault(); if (activeId) closeTab(activeId); }
   else if (k === 'r'){ e.preventDefault(); reloadActive(); }
@@ -1261,8 +1316,9 @@ window.__LYNK__ = {
 
 connectLynk();
 setStatus('', 'Ready');
+/* FIX: JS-free DDG endpoint on first launch. */
 if (!restoreTabs()){
-  addTab('https://duckduckgo.com');
+  addTab(DEFAULT_TAB_URL);
 }
 window.addEventListener('beforeunload', function(){ saveTabs(); });
 setTimeout(applyFrameLayout, 60);

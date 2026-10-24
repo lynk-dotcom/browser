@@ -57,8 +57,9 @@ font-family:inherit;font-size:13px;padding:8px 6px;cursor:pointer;max-width:130p
 form.search select option{background:var(--bg-2);color:var(--fg)}
 form.search button{padding:11px 22px;border-radius:10px;border:none;background:var(--grad);
 color:#0b1220;font-weight:700;cursor:pointer;font-family:inherit;font-size:13px;
-min-height:42px;flex-shrink:0}
-form.search button:hover{filter:brightness(1.08)}
+min-height:42px;flex-shrink:0;transition:filter .15s,opacity .15s}
+form.search button:hover:not(:disabled){filter:brightness(1.08)}
+form.search button:disabled{opacity:.6;cursor:wait}
 .kbd{display:inline-flex;align-items:center;justify-content:center;padding:2px 7px;
 min-width:22px;height:22px;background:rgba(148,163,184,.12);
 border:1px solid rgba(148,163,184,.2);border-radius:5px;
@@ -79,7 +80,7 @@ font-family:'JetBrains Mono',ui-monospace,monospace;letter-spacing:.02em}
   <div class="brand">
     <div class="mark">L</div>
     <div>
-      <h1>Lynkio <span class="ver">v18.2</span></h1>
+      <h1>Lynkio <span class="ver">v20.0</span></h1>
       <div class="sub">Multi-tab browser · vulnerability scanner · page cloner · offensive toolkit</div>
     </div>
   </div>
@@ -97,7 +98,7 @@ font-family:'JetBrains Mono',ui-monospace,monospace;letter-spacing:.02em}
       <option value="wikipedia">Wikipedia</option>
       <option value="github">GitHub</option>
     </select>
-    <button type="submit">Search</button>
+    <button type="submit" id="searchBtn">Search</button>
   </form>
 </div>
 
@@ -106,7 +107,7 @@ font-family:'JetBrains Mono',ui-monospace,monospace;letter-spacing:.02em}
     <div class="ic">🗂</div><div class="nm">Multi-tab browser</div>
     <div class="dc">Tab strip, console, WebSocket control plane, streaming proxy, toolkit, cloner.</div>
   </a>
-  <a class="card" href="/proxy?url=https%3A%2F%2Fduckduckgo.com">
+  <a class="card" href="/proxy?url=https%3A%2F%2Fduckduckgo.com%2Fhtml%2F">
     <div class="ic">🛠</div><div class="nm">Open a URL</div>
     <div class="dc">Load anything through the streaming proxy — HTML / CSS rewritten in flight.</div>
   </a>
@@ -132,12 +133,13 @@ font-family:'JetBrains Mono',ui-monospace,monospace;letter-spacing:.02em}
   <a class="hint-item" href="/tabs"><span class="kbd">Ctrl</span>+<span class="kbd">`</span> console</a>
 </div>
 
-<footer>lynkio v18.2 · bind 0.0.0.0:8080</footer>
+<footer>lynkio v20.0 · bind 0.0.0.0:8080</footer>
 
 <script>
 (function(){
   var input = document.getElementById('searchInput');
   var form  = document.getElementById('searchForm');
+  var btn   = document.getElementById('searchBtn');
   if (!input || !form) return;
 
   document.addEventListener('keydown', function(e){
@@ -163,6 +165,22 @@ font-family:'JetBrains Mono',ui-monospace,monospace;letter-spacing:.02em}
     if (e.key === 'Escape' && document.activeElement === input){
       input.value = '';
       input.blur();
+    }
+  });
+
+  // FIX: disable the submit button while the (proxy-based) search is in flight
+  // so the UI doesn't look frozen and the user cannot double-submit. Restore
+  // if the page is restored from the bfcache (browser back button).
+  form.addEventListener('submit', function(){
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Searching…';
+    }
+  });
+  window.addEventListener('pageshow', function(e){
+    if (e.persisted && btn) {
+      btn.disabled = false;
+      btn.textContent = 'Search';
     }
   });
 })();

@@ -454,6 +454,15 @@ def _js_stub(status, target_url, preview=b""):
         preview_txt = preview.decode("utf-8", "replace").replace("*/", "* /")
     except Exception:
         preview_txt = ""
+    # FIX: log every stub creation. When DDG (or any site) breaks with
+    # "X is not defined", the log tells you exactly which JS file failed and
+    # what the upstream returned for it (status + first 80 chars of body).
+    log.warning(
+        "js stub served for %s (upstream status %d, preview: %s)",
+        target_url,
+        status,
+        preview_txt[:80].replace("\n", " ").replace("\r", " "),
+    )
     body = (
         "/* lynkio: upstream returned %d for this JS chunk.\n"
         "   target: %s\n"
@@ -467,7 +476,7 @@ def _js_stub(status, target_url, preview=b""):
         json.dumps(target_url),
     )
     return body.encode("utf-8")
-
+    
 
 def _css_stub(status, target_url):
     body = (
@@ -2191,15 +2200,8 @@ async def serve_proxied(req, target_url, sid):
     parsed = urlparse(target_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    # ================================================================
-    # Bug 2 fix: Cloudflare challenge-platform short-circuit
-    # ================================================================
-    # The orchestrate script reads window._cf_chl_opt, which only exists
-    # in the challenge page's own document. Proxying it into a rewritten
-    # page produces:
-    #   TypeError: undefined is not an object
-    #   (evaluating 'window._cf_chl_opt.qFyP3=false')
-    # Never proxy /cdn-cgi/challenge-platform/*.
+    # Cloudflare challenge-platform short-circuit — never proxy these assets,
+    # they read window._cf_chl_opt which only exists in the challenge document.
     if parsed.path.startswith("/cdn-cgi/challenge-platform/"):
         wants = _requested_kind(req, target_url)
         is_script = (
@@ -2246,11 +2248,7 @@ async def serve_proxied(req, target_url, sid):
         resp.add_header("Cache-Control", "no-store")
         return resp
 
-    # ================================================================
-    # Bug 3 fix: cache-buster-aware CDP cache lookup
-    # ================================================================
-    # The interstitial appends _t=<timestamp> to force re-fetch. Strip
-    # it before lookup so the freshly captured HTML is found.
+    # Cache-buster-aware CDP capture lookup
     _lookup_keys = [target_url]
     try:
         _p = urlparse(target_url)
@@ -2289,7 +2287,6 @@ async def serve_proxied(req, target_url, sid):
                          f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
         return _resp
 
-    # Self-target guard
     if is_self_target(req, target_url):
         recovered = _recover_origin(req, sess)
         if recovered:
@@ -2333,8 +2330,18 @@ async def serve_proxied(req, target_url, sid):
     if merged:
         out_headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in merged.items())
 
+    # FIX (DDG fix): include "script" and "style" in the stealth-routed kinds.
+    # Without this, JS and CSS sub-resource requests fell through to the raw
+    # socket path, which uses Python's TLS fingerprint. Cloudflare answers
+    # those with a challenge HTML for JS URLs, which the raw-socket branch
+    # detects as "wants == script, content-type text/html" and replaces with
+    # a JS stub. Result: DDG (and any other CF-fronted site that shards JS)
+    # reports "X is not defined" because the stub never sets the globals the
+    # inline scripts expect. Routing JS/CSS through curl_cffi's Chrome TLS
+    # impersonation makes Cloudflare accept the request and deliver the real
+    # bundle.
     use_stealth = (HAS_CURL_CFFI
-                   and wants in ("document", "data", "")
+                   and wants in ("document", "data", "", "script", "style")
                    and req.method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"))
 
     # -------- Stealth branch --------
@@ -2347,7 +2354,7 @@ async def serve_proxied(req, target_url, sid):
                 jar_cookies[k.strip()] = v.strip()
         stealth = await _stealth_fetch_raw(
             target_url, method=req.method, headers=out_headers,
-            body=req.body, timeout=30.0,
+            body=req.body, timeout=60.0,
             allow_redirects=False, max_redirects=0,
             session_cookies=jar_cookies)
         if stealth is not None:
@@ -2363,19 +2370,54 @@ async def serve_proxied(req, target_url, sid):
                 except Exception:
                     pass
 
+            # FIX: for sub-resources, the "solve target" is the PARENT page
+            # (from Referer), not the asset URL. Capturing a .js URL via CDP
+            # produces garbage (Chrome wraps raw JS in a <pre> element).
+            solve_url = target_url
+            solve_origin = origin
+            if wants in ("script", "style", "media"):
+                parent = extract_upstream(req.headers.get("referer", ""))
+                if parent:
+                    solve_url = parent
+                    pp = urlparse(parent)
+                    if pp.scheme in ("http", "https") and pp.netloc:
+                        solve_origin = f"{pp.scheme}://{pp.netloc}"
+
+            def _sub_resource_stub():
+                if wants == "script":
+                    r = RawResponse(
+                        _js_stub(s_status, target_url, s_body[:200]),
+                        status=200,
+                        content_type="application/javascript; charset=utf-8")
+                    r.add_header("Cache-Control", "no-store")
+                    return r
+                if wants == "style":
+                    r = RawResponse(
+                        _css_stub(s_status, target_url),
+                        status=200, content_type="text/css; charset=utf-8")
+                    r.add_header("Cache-Control", "no-store")
+                    return r
+                return None
+
             if _is_google_sorry(s_status, s_headers, s_body, s_final_url):
                 log.warning("google sorry on %s (stealth, %d)", target_url, s_status)
                 if cdp_routes.is_available():
                     token = cdp_routes._new_token()
                     asyncio.create_task(cdp_routes._solve_async(
-                        token, target_url, origin, sid,
+                        token, solve_url, solve_origin, sid,
                         {"get_session": get_session}))
+                    r = _sub_resource_stub()
+                    if r is not None:
+                        return r
                     return RawResponse(
-                        cdp_routes.solving_page(target_url, origin, token).encode("utf-8"),
+                        cdp_routes.solving_page(solve_url, solve_origin, token).encode("utf-8"),
                         content_type="text/html; charset=utf-8")
                 key = f"{origin}|{target_url}"
                 attempts = int(sess.challenge_attempts.get(key, 0))
-                return _google_sorry_page(target_url, origin, attempts)
+                r = _sub_resource_stub()
+                if r is not None:
+                    return r
+                return _google_sorry_page(solve_url, solve_origin, attempts)
 
             if _is_cf_challenge(s_status, s_headers, s_body):
                 log.warning("cloudflare challenge on %s (stealth, %d) — trying CDP",
@@ -2383,14 +2425,20 @@ async def serve_proxied(req, target_url, sid):
                 if cdp_routes.is_available():
                     token = cdp_routes._new_token()
                     asyncio.create_task(cdp_routes._solve_async(
-                        token, target_url, origin, sid,
+                        token, solve_url, solve_origin, sid,
                         {"get_session": get_session}))
+                    r = _sub_resource_stub()
+                    if r is not None:
+                        return r
                     return RawResponse(
-                        cdp_routes.solving_page(target_url, origin, token).encode("utf-8"),
+                        cdp_routes.solving_page(solve_url, solve_origin, token).encode("utf-8"),
                         content_type="text/html; charset=utf-8")
                 key = f"{origin}|{target_url}"
                 attempts = int(sess.challenge_attempts.get(key, 0))
-                return _cf_challenge_page(target_url, origin, "cloudflare", attempts)
+                r = _sub_resource_stub()
+                if r is not None:
+                    return r
+                return _cf_challenge_page(solve_url, solve_origin, "cloudflare", attempts)
 
             if 300 <= s_status < 400:
                 loc = ""
@@ -2604,20 +2652,22 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
+    # -------- HLS branch --------
     is_m3u8 = ("mpegurl" in low_ct
                or "application/vnd.apple" in low_ct
                or path_lower.endswith(".m3u8"))
     if is_m3u8:
         buf = bytearray(); oversized = False
+        body_iter = _iter_body(reader, up_headers, first)
         try:
-            async for chunk in _iter_body(reader, up_headers, first):
+            async for chunk in body_iter:
                 buf.extend(chunk)
                 if len(buf) > MAX_HLS_BYTES:
                     oversized = True
                     break
         except Exception:
             pass
-        await _close_writer(writer)
+
         if oversized:
             head_bytes = bytes(buf)
             resp_headers = _build_response_headers(up_headers, is_rewritten=False)
@@ -2626,12 +2676,19 @@ async def serve_proxied(req, target_url, sid):
             async def phls_raw():
                 try:
                     yield head_bytes
-                finally:
+                    async for chunk in body_iter:
+                        yield chunk
+                except (ConnectionResetError, BrokenPipeError):
                     pass
+                except Exception as e:
+                    log.debug("phls_raw aborted: %s", e)
+                finally:
+                    await _close_writer(writer)
             return StreamingResponse(phls_raw(),
                                      content_type="application/vnd.apple.mpegurl",
                                      headers=resp_headers, status=status)
 
+        await _close_writer(writer)
         raw = bytes(buf)
         if ce and ce != "identity":
             raw = _decompress(raw, ce)
@@ -2729,12 +2786,13 @@ async def serve_proxied(req, target_url, sid):
             _add_cookies_to_response(resp, up_headers, origin_host)
             return resp
 
-    # -------- HTML (Bug 4 fix applied) --------
+    # -------- HTML branch --------
     if (not is_static_asset) and ("text/html" in low_ct
                                    or "application/xhtml" in low_ct):
         buf = bytearray(); rewritable = True
+        body_iter = _iter_body(reader, up_headers, first)
         try:
-            async for chunk in _iter_body(reader, up_headers, first):
+            async for chunk in body_iter:
                 buf.extend(chunk)
                 if len(buf) > MAX_REWRITE_BYTES:
                     rewritable = False
@@ -2796,9 +2854,6 @@ async def serve_proxied(req, target_url, sid):
                             f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
             return resp
 
-        # Bug 4 fix: oversized HTML — do NOT close upstream. Stream the
-        # remainder from the still-open socket. Pop Content-Length so
-        # chunked encoding wins.
         head_bytes = bytes(buf)
         resp_headers = _build_response_headers(up_headers, is_rewritten=False)
         resp_headers.pop("Content-Length", None)
@@ -2807,8 +2862,7 @@ async def serve_proxied(req, target_url, sid):
         async def passthrough_html():
             try:
                 yield head_bytes
-                async for chunk in _iter_body(reader, up_headers, b"",
-                                               chunk_size=STREAM_CHUNK_SIZE):
+                async for chunk in body_iter:
                     yield chunk
             except (ConnectionResetError, BrokenPipeError):
                 pass
@@ -2821,11 +2875,12 @@ async def serve_proxied(req, target_url, sid):
                                  content_type="text/html; charset=utf-8",
                                  headers=resp_headers, status=status)
 
-    # -------- CSS (Bug 4 fix applied) --------
+    # -------- CSS branch --------
     if (not is_static_asset) and "text/css" in low_ct:
         buf = bytearray(); oversized = False
+        body_iter = _iter_body(reader, up_headers, first)
         try:
-            async for chunk in _iter_body(reader, up_headers, first):
+            async for chunk in body_iter:
                 buf.extend(chunk)
                 if len(buf) > MAX_CSS_BYTES:
                     oversized = True
@@ -2841,8 +2896,7 @@ async def serve_proxied(req, target_url, sid):
             async def pcss():
                 try:
                     yield head_bytes
-                    async for chunk in _iter_body(reader, up_headers, b"",
-                                                   chunk_size=STREAM_CHUNK_SIZE):
+                    async for chunk in body_iter:
                         yield chunk
                 except (ConnectionResetError, BrokenPipeError):
                     pass
@@ -2887,9 +2941,10 @@ async def serve_proxied(req, target_url, sid):
     buf = bytearray()
     overflow = False
     read_complete = True
+    body_iter = _iter_body(reader, up_headers, first,
+                            chunk_size=STREAM_CHUNK_SIZE)
     try:
-        async for chunk in _iter_body(reader, up_headers, first,
-                                       chunk_size=STREAM_CHUNK_SIZE):
+        async for chunk in body_iter:
             buf.extend(chunk)
             if len(buf) > MAX_BUFFER_BYTES:
                 overflow = True
@@ -2955,8 +3010,7 @@ async def serve_proxied(req, target_url, sid):
     async def passthrough():
         try:
             yield head_bytes
-            async for chunk in _iter_body(reader, up_headers, b"",
-                                           chunk_size=STREAM_CHUNK_SIZE):
+            async for chunk in body_iter:
                 yield chunk
         except (ConnectionResetError, BrokenPipeError):
             pass
@@ -2966,6 +3020,7 @@ async def serve_proxied(req, target_url, sid):
             await _close_writer(writer)
 
     return StreamingResponse(passthrough(), content_type=ctype, headers=resp_headers, status=status)
+                             
                              
                              
 async def _try_proxy_candidates(req, sess, sid, path_only, qs, candidates):
