@@ -2,11 +2,12 @@ FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Chromium and required system dependencies
+# Install Chromium, Xvfb, and required system dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         chromium \
         chromium-common \
+        xvfb \
         fonts-liberation \
         ca-certificates \
         tini \
@@ -32,7 +33,8 @@ RUN test -x /usr/bin/chromium \
 
 # Application configuration
 ENV HOME=/tmp \
-    CDP_HEADLESS=1 \
+    DISPLAY=:99 \
+    CDP_HEADLESS=0 \
     CHROME_BIN=/usr/bin/chromium \
     PORT=8080 \
     DEFAULT_SEARCH_ENGINE=ddg \
@@ -57,5 +59,7 @@ USER lynk
 
 EXPOSE 8080
 
+# Start Xvfb, configure the display, and launch the application
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["python3", "brow.py"]
+
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 -ac & while ! xdpyinfo -display :99 >/dev/null 2>&1; do sleep 0.2; done; export DISPLAY=:99; export CDP_HEADLESS=0; exec python3 brow.py"]

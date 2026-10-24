@@ -205,28 +205,99 @@ def _scheme(origin):
         return "https"
 
 
-async def wait_challenge_cleared(client, session, origin, timeout=90.0):
-    """FIX: default raised from 30s to 90s and checks body length as a fallback."""
+async def wait_challenge_cleared(client, session, origin, timeout=180.0):
+    """Wait until the challenge is *definitively* solved.
+
+    Previous version returned True as soon as body text exceeded 200 chars.
+    That is wrong for Google /sorry/index pages (and any challenge page that
+    ships substantial body text from the start): the captcha lives inside an
+    iframe and takes real user interaction to complete, but the body text was
+    already over the threshold on first paint. The result was that _solve_async
+    captured the *unsolved* page, cached it, and served it back to the user —
+    which looked exactly like "the captcha loads but never approves".
+
+    New behaviour per origin type:
+      - Google (google.com / googleapis.com / gstatic.com):
+            wait for location.href to leave /sorry/ entirely.
+            Google only redirects away from /sorry/index after the captcha
+            has actually passed.
+      - Cloudflare (any origin that ships cf_clearance):
+            wait for the cf_clearance cookie (unchanged).
+      - Everyone else:
+            wait for body text > 200 chars AND that text must not contain any
+            known challenge marker ("just a moment", "checking your browser",
+            "unusual traffic", "_cf_chl", etc.). This catches the case where a
+            non-Google challenge serves the same shape of page but with a
+            different hostname.
+    """
     deadline = time.time() + timeout
+    is_google = (
+        "google." in origin.lower()
+        or "googleapis." in origin.lower()
+        or "gstatic." in origin.lower()
+    )
+
     while time.time() < deadline:
+        # ---- Cloudflare: cf_clearance cookie is definitive ----
         try:
             cookies = await cdp_client.get_cookies(client, session)
             if any(c.get("name") == "cf_clearance" for c in cookies):
                 await asyncio.sleep(1.0)
                 return True
         except Exception:
-            pass
+            cookies = []
 
+        # ---- Google sorry: only clears when URL leaves /sorry/ ----
+        if is_google:
+            try:
+                cur_url = await cdp_client.evaluate(
+                    client, session, "location.href", await_promise=False
+                ) or ""
+                if cur_url and "/sorry/" not in cur_url and "/sorry/index" not in cur_url:
+                    # Page navigated away from the sorry page — captcha passed.
+                    await asyncio.sleep(1.0)
+                    return True
+            except Exception:
+                pass
+            # Still on /sorry/index. Keep waiting — do NOT check body length,
+            # because the sorry page already has ~700 chars of body text from
+            # first paint and would falsely satisfy any length heuristic.
+            await asyncio.sleep(0.8)
+            continue
+
+        # ---- Non-Google: body text AND no challenge markers ----
         try:
-            body_len = await cdp_client.evaluate(
-                client, session, "document.body ? document.body.innerText.length : 0", await_promise=False
+            result = await cdp_client.evaluate(
+                client,
+                session,
+                "(function(){"
+                "  var el = document.body;"
+                "  if (!el) return -1;"
+                "  var t = el.innerText || '';"
+                "  if (t.length < 200) return 0;"
+                "  var low = t.toLowerCase();"
+                "  var markers = ["
+                "    'just a moment', 'checking your browser',"
+                "    'verify you are human', 'enable javascript and cookies',"
+                "    'unusual traffic', 'are you a robot', 'press and hold',"
+                "    'challenge-platform', '_cf_chl', 'turnstile',"
+                "    'complete the security check'"
+                "  ];"
+                "  for (var i = 0; i < markers.length; i++){"
+                "    if (low.indexOf(markers[i]) !== -1) return -1;"
+                "  }"
+                "  return t.length;"
+                "})()",
+                await_promise=False,
             )
-            if body_len and body_len > 200:
+            if result and result > 200:
+                await asyncio.sleep(1.0)
                 return True
         except Exception:
             pass
 
         await asyncio.sleep(0.8)
+
     return False
 
 
@@ -239,12 +310,11 @@ async def capture(client, session, url, origin, sess=None):
     if cur != url:
         await cdp_client.navigate(client, session, url)
 
-    # FIX: wait for network idle (resource count stable for 2s), not just readyState.
     await cdp_client.wait_ready(client, session, timeout=90.0)
 
-    # FIX: give challenge JS / iframe loaders more time (was 2.5s).
+    # Give challenge JS / iframe loaders time to run.
     await asyncio.sleep(5.0)
-    await wait_challenge_cleared(client, session, origin, timeout=90.0)
+    await wait_challenge_cleared(client, session, origin, timeout=180.0)
 
     html = await cdp_client.get_html(client, session)
     raw_cookies = await cdp_client.get_cookies(client, session)

@@ -234,9 +234,16 @@ def is_available():
 
 # ------------------------------------------------------- solve / capture
 async def _solve_async(token, target_url, origin, sid, ctx):
-    """Open URL in real Chrome, wait for network idle, capture DOM+state.
-    Deduplicates concurrent solves for the same URL.
-    Keeps the tab open so ongoing requests can finish.
+    """Open URL in real Chrome, wait for the challenge to *actually* clear,
+    capture DOM+state, and cache it.
+
+    Never caches the page if it still looks like a challenge — the previous
+    version would snapshot the /sorry/index page before the user finished the
+    captcha, cache it, and serve that snapshot back on the next request. That
+    is what made the checkbox look like it "never approves".
+
+    Never closes the tab. Ongoing XHR / WebSocket / challenge requests are
+    allowed to finish naturally.
     """
     existing = _SOLVE_INFLIGHT.get(target_url)
     if existing and existing != token:
@@ -283,24 +290,65 @@ async def _solve_async(token, target_url, origin, sid, ctx):
 
         await cdp_client.navigate(client, session_id, target_url)
 
-        # FIX: timeouts raised from 30s / 20s to 90s / 90s.
+        # Wait for the page itself to finish loading.
         await cdp_client.wait_ready(client, session_id, timeout=90.0)
-        await browser_capture.wait_challenge_cleared(client, session_id, origin, timeout=90.0)
 
-        clone = await browser_capture.capture(client, session_id, target_url, origin, sess)
+        # Wait for the CHALLENGE to clear. This is the fix — previously this
+        # returned in <1s on Google sorry pages, so capture() below ran on the
+        # unsolved page. Now it blocks until the URL leaves /sorry/ for Google
+        # or the appropriate cf_clearance / non-challenge body state for CF.
+        cleared = await browser_capture.wait_challenge_cleared(
+            client, session_id, origin, timeout=180.0
+        )
+        if not cleared:
+            _SOLVES[token] = {
+                "status": "error",
+                "error": "challenge did not clear within 180s — solve it in the Chrome window and retry",
+            }
+            return
+
+        clone = await browser_capture.capture(
+            client, session_id, target_url, origin, sess
+        )
+
+        # Belt-and-suspenders: refuse to cache if the captured HTML still
+        # contains challenge markers. This catches the case where
+        # wait_challenge_cleared returned True but the page is actually still
+        # a challenge (e.g. a variant we haven't seen before).
+        low = (clone.get("outer_html") or "").lower()
+        unresolved_markers = (
+            "_cf_chl_opt",
+            "cf_chl_opt",
+            "cdn-cgi/challenge-platform",
+            "cf-browser-verification",
+            "just a moment",
+            "checking your browser",
+            "/sorry/index",
+            "our systems have detected unusual traffic",
+        )
+        for marker in unresolved_markers:
+            if marker in low:
+                log.warning(
+                    "cdp: captured page still contains challenge marker %r — "
+                    "not caching", marker
+                )
+                _SOLVES[token] = {
+                    "status": "error",
+                    "error": "page still shows a challenge — solve it manually and retry",
+                }
+                return
+
         sess.cdp_captures[target_url] = clone["outer_html"]
         _SOLVES[token] = {"status": "ready", "uuid": clone["uuid"]}
         log.info("cdp: capture %s ready (uuid=%s)", token[:8], clone["uuid"])
 
-        # FIX: do not close the tab. Ongoing XHR / WebSocket / challenge
-        # requests must be allowed to finish.
+        # Do not close the tab — ongoing requests need to finish.
     except Exception as e:
         log.warning("cdp solve %s failed: %s", token[:8], e)
         _SOLVES[token] = {"status": "error", "error": str(e)}
     finally:
         if _SOLVE_INFLIGHT.get(target_url) == token:
             _SOLVE_INFLIGHT.pop(target_url, None)
-
 
 def _new_token():
     tok = uuid.uuid4().hex[:12]
