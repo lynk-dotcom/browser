@@ -2155,7 +2155,16 @@ async def serve_proxied(req, target_url, sid):
     parsed = urlparse(target_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    # ---- Cloudflare challenge-platform short-circuit ----
+    # ================================================================
+    # Cloudflare challenge-platform short-circuit
+    # ================================================================
+    # The orchestrate script reads window._cf_chl_opt, which only exists
+    # inside the challenge page's own document. Proxying it produces:
+    #   TypeError: undefined is not an object
+    #   (evaluating 'window._cf_chl_opt.qFyP3=false')
+    # Never proxy the challenge-platform tree. Scripts return an empty stub,
+    # HTML challenge pages hand off to CDP or the interstitial, and any
+    # other asset type gets a typed stub so the browser doesn't retry.
     if parsed.path.startswith("/cdn-cgi/challenge-platform/"):
         wants = _requested_kind(req, target_url)
         is_script = (
@@ -2204,9 +2213,37 @@ async def serve_proxied(req, target_url, sid):
         resp.add_header("Cache-Control", "no-store")
         return resp
 
-    # ---- Cached CDP capture ----
-    _cached_cdp = sess.cdp_captures.pop(target_url, None)
+    # ================================================================
+    # Cached CDP capture early return (cache-buster aware)
+    # ================================================================
+    # The interstitial appends `_t=<timestamp>` to force a re-fetch. That
+    # buster must be stripped before the cache lookup, otherwise every
+    # reload misses the cache and re-enters the solve loop — the exact
+    # "solved but won't navigate" symptom.
+    _lookup_keys = [target_url]
+    try:
+        _p = urlparse(target_url)
+        if _p.query:
+            _kept = [(k, v) for k, v in parse_qsl(_p.query, keep_blank_values=True)
+                     if k not in ("_t", "_", "cb", "cachebuster")]
+            _stripped = _p._replace(query=urlencode(_kept, doseq=True)).geturl()
+            if _stripped not in _lookup_keys:
+                _lookup_keys.append(_stripped)
+            _bare = _p._replace(query="").geturl()
+            if _bare not in _lookup_keys:
+                _lookup_keys.append(_bare)
+    except Exception:
+        pass
+
+    _cached_cdp = None
+    _hit_key = ""
+    for _k in _lookup_keys:
+        _cached_cdp = sess.cdp_captures.pop(_k, None)
+        if _cached_cdp:
+            _hit_key = _k
+            break
     if _cached_cdp:
+        log.info("cdp: cache hit for %s (key=%s)", target_url, _hit_key)
         sess.page_origin = origin
         _ctx = {"upstream": target_url, "sid": sid,
                 "preserve_captcha": True,
@@ -2221,7 +2258,9 @@ async def serve_proxied(req, target_url, sid):
                          f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
         return _resp
 
-    # ---- Self-target guard ----
+    # ================================================================
+    # Self-target guard
+    # ================================================================
     if is_self_target(req, target_url):
         recovered = _recover_origin(req, sess)
         if recovered:
@@ -2272,7 +2311,7 @@ async def serve_proxied(req, target_url, sid):
                    and req.method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"))
 
     # ================================================================
-    # Stealth branch
+    # Stealth branch (curl_cffi)
     # ================================================================
     if use_stealth:
         jar_cookies = {}
@@ -2690,7 +2729,7 @@ async def serve_proxied(req, target_url, sid):
             return resp
 
     # ================================================================
-    # HTML — FIXED: don't close upstream before streaming the remainder
+    # HTML (with streaming fix for oversized bodies)
     # ================================================================
     if (not is_static_asset) and ("text/html" in low_ct
                                    or "application/xhtml" in low_ct):
@@ -2707,8 +2746,8 @@ async def serve_proxied(req, target_url, sid):
         raw = bytes(buf)
         hdr_dict = {k: v for k, v in up_headers}
 
-        # Challenge / Google-sorry detection works even when oversized —
-        # these markers appear in the first few KB.
+        # Challenge detection works even when oversized — markers appear
+        # in the first few KB regardless of total size.
         if _is_google_sorry(status, hdr_dict, raw, target_url):
             log.warning("google sorry on %s (raw, %d)", target_url, status)
             await _close_writer(writer)
@@ -2741,7 +2780,6 @@ async def serve_proxied(req, target_url, sid):
             return _cf_challenge_page(target_url, origin, "cloudflare", attempts)
 
         if rewritable:
-            # Full body was buffered — close upstream and serve rewritten HTML.
             await _close_writer(writer)
             if ce and ce != "identity":
                 raw = _decompress(raw, ce)
@@ -2763,14 +2801,9 @@ async def serve_proxied(req, target_url, sid):
                             f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
             return resp
 
-        # ---- Oversized HTML: stream the remainder from the still-open socket ----
+        # Oversized HTML — do NOT close upstream. Stream the remainder.
         head_bytes = bytes(buf)
         resp_headers = _build_response_headers(up_headers, is_rewritten=False)
-        # CRITICAL: drop the stale Content-Length from upstream. If we kept
-        # it, the client would wait for bytes we're about to stream but
-        # then see chunked encoding override it — or worse, see a
-        # Content-Length larger than the actual bytes when the upstream
-        # closes mid-stream. Either way, the browser stalls or truncates.
         resp_headers.pop("Content-Length", None)
         _add_cookies_to_streaming(resp_headers, up_headers, origin_host)
 
@@ -2792,7 +2825,7 @@ async def serve_proxied(req, target_url, sid):
                                  headers=resp_headers, status=status)
 
     # ================================================================
-    # CSS — same fix applied
+    # CSS (same streaming fix)
     # ================================================================
     if (not is_static_asset) and "text/css" in low_ct:
         buf = bytearray(); oversized = False
@@ -2840,7 +2873,7 @@ async def serve_proxied(req, target_url, sid):
         return resp
 
     # ================================================================
-    # Default passthrough (already correct — this branch always popped CL)
+    # Default passthrough
     # ================================================================
     resp_headers = _build_response_headers(up_headers, is_rewritten=False)
 
@@ -2945,8 +2978,7 @@ async def serve_proxied(req, target_url, sid):
         finally:
             await _close_writer(writer)
 
-    return StreamingResponse(passthrough(), content_type=ctype, headers=resp_headers, status=status)
-                             
+    return StreamingResponse(passthrough(), content_type=ctype, headers=resp_headers, status=status)                             
 
 async def _try_proxy_candidates(req, sess, sid, path_only, qs, candidates):
     dest = (req.headers.get("sec-fetch-dest") or "").lower()
