@@ -296,7 +296,7 @@ def _is_cf_challenge(status, headers_dict, body):
     they are. The markers below are Cloudflare-internal strings that
     never appear on a normal page, so any one of them is definitive.
     """
-    # 1. Documented Cloudflare signal (cheap, definitive)
+    # 1. Documented Cloudflare signal — cheap, definitive
     try:
         for k, v in headers_dict.items():
             if k.lower() == "cf-mitigated" and str(v).lower() == "challenge":
@@ -310,11 +310,11 @@ def _is_cf_challenge(status, headers_dict, body):
     # 2. Definitive body markers, independent of status code
     low = bytes(body[:32768]).lower()
     for marker in (
-        b"_cf_chl_opt",                 # the config object from your error
-        b"cf_chl_opt",                  # variant spelling
-        b"cdn-cgi/challenge-platform",  # orchestrate script URL
-        b"cf-browser-verification",     # legacy interstitial
-        b"cf_challenge",                # generic
+        b"_cf_chl_opt",
+        b"cf_chl_opt",
+        b"cdn-cgi/challenge-platform",
+        b"cf-browser-verification",
+        b"cf_challenge",
     ):
         if marker in low:
             return True
@@ -324,14 +324,13 @@ def _is_cf_challenge(status, headers_dict, body):
             and (b"just a moment" in low or b"checking your browser" in low)):
         return True
 
-    # 4. Legacy status-only fallback (still useful for older builds)
+    # 4. Legacy status-only fallback for older builds
     if status in (403, 429, 503):
         for sig in _CF_BODY_SIGNATURES:
             if sig in low:
                 return True
 
-    return False
-    
+    return False    
 
 # ======================================================================
 # Google "unusual traffic" detection
@@ -2156,15 +2155,14 @@ async def serve_proxied(req, target_url, sid):
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
     # ================================================================
-    # Cloudflare challenge-platform short-circuit
+    # Bug 2 fix: Cloudflare challenge-platform short-circuit
     # ================================================================
     # The orchestrate script reads window._cf_chl_opt, which only exists
-    # inside the challenge page's own document. Proxying it produces:
+    # in the challenge page's own document. Proxying it into a rewritten
+    # page produces:
     #   TypeError: undefined is not an object
     #   (evaluating 'window._cf_chl_opt.qFyP3=false')
-    # Never proxy the challenge-platform tree. Scripts return an empty stub,
-    # HTML challenge pages hand off to CDP or the interstitial, and any
-    # other asset type gets a typed stub so the browser doesn't retry.
+    # Never proxy /cdn-cgi/challenge-platform/*.
     if parsed.path.startswith("/cdn-cgi/challenge-platform/"):
         wants = _requested_kind(req, target_url)
         is_script = (
@@ -2204,9 +2202,7 @@ async def serve_proxied(req, target_url, sid):
         if ext == ".css" or wants == "style":
             resp = RawResponse(
                 b"/* lynkio: cloudflare challenge asset not proxied */",
-                status=200,
-                content_type="text/css; charset=utf-8",
-            )
+                status=200, content_type="text/css; charset=utf-8")
         else:
             resp = RawResponse(b"", status=204,
                                content_type="application/octet-stream")
@@ -2214,12 +2210,10 @@ async def serve_proxied(req, target_url, sid):
         return resp
 
     # ================================================================
-    # Cached CDP capture early return (cache-buster aware)
+    # Bug 3 fix: cache-buster-aware CDP cache lookup
     # ================================================================
-    # The interstitial appends `_t=<timestamp>` to force a re-fetch. That
-    # buster must be stripped before the cache lookup, otherwise every
-    # reload misses the cache and re-enters the solve loop — the exact
-    # "solved but won't navigate" symptom.
+    # The interstitial appends _t=<timestamp> to force re-fetch. Strip
+    # it before lookup so the freshly captured HTML is found.
     _lookup_keys = [target_url]
     try:
         _p = urlparse(target_url)
@@ -2258,9 +2252,7 @@ async def serve_proxied(req, target_url, sid):
                          f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
         return _resp
 
-    # ================================================================
     # Self-target guard
-    # ================================================================
     if is_self_target(req, target_url):
         recovered = _recover_origin(req, sess)
         if recovered:
@@ -2275,8 +2267,7 @@ async def serve_proxied(req, target_url, sid):
         if is_self_target(req, target_url):
             return error_page(
                 "Refusing to proxy to itself",
-                f"<code>{esc(target_url)}</code> is this proxy.",
-                508)
+                f"<code>{esc(target_url)}</code> is this proxy.", 508)
 
     sess.last_origin = origin
     sess.note_origin(origin)
@@ -2286,7 +2277,6 @@ async def serve_proxied(req, target_url, sid):
                            content_type="text/html; charset=utf-8")
 
     wants = _requested_kind(req, target_url)
-
     out_headers = _collect_request_headers(req, target_url)
     out_headers["Referer"] = _referer_for(req, sess, target_url, origin)
 
@@ -2310,9 +2300,7 @@ async def serve_proxied(req, target_url, sid):
                    and wants in ("document", "data", "")
                    and req.method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"))
 
-    # ================================================================
-    # Stealth branch (curl_cffi)
-    # ================================================================
+    # -------- Stealth branch --------
     if use_stealth:
         jar_cookies = {}
         for c in (jar_cookie or "").split(";"):
@@ -2324,8 +2312,7 @@ async def serve_proxied(req, target_url, sid):
             target_url, method=req.method, headers=out_headers,
             body=req.body, timeout=30.0,
             allow_redirects=False, max_redirects=0,
-            session_cookies=jar_cookies,
-        )
+            session_cookies=jar_cookies)
         if stealth is not None:
             s_status = stealth["status"]
             s_headers = stealth["headers"]
@@ -2396,35 +2383,26 @@ async def serve_proxied(req, target_url, sid):
                 sess.page_origin = origin
                 ctx = {"upstream": target_url, "sid": sid,
                        "preserve_captcha": True,
-                       "_injected": [s["code"] for s in sess.injected
-                                     if s["enabled"]]}
+                       "_injected": [s["code"] for s in sess.injected if s["enabled"]]}
                 body = HTMLRewriter(target_url, ctype, ctx).rewrite(s_body)
-                resp_headers = _build_response_headers(s_headers_list,
-                                                        is_rewritten=True)
+                resp_headers = _build_response_headers(s_headers_list, is_rewritten=True)
                 resp = RawResponse(body, status=s_status,
                                    content_type="text/html; charset=utf-8",
                                    headers=resp_headers)
-                _add_cookies_to_response(resp, s_headers_list,
-                                         parsed.hostname or "")
-                resp.add_header(
-                    "Set-Cookie",
-                    f"{SESSION_COOKIE}={sid}; Path=/; Max-Age=86400; SameSite=Lax")
-                resp.add_header(
-                    "Set-Cookie",
-                    f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
+                _add_cookies_to_response(resp, s_headers_list, parsed.hostname or "")
+                resp.add_header("Set-Cookie",
+                                f"{SESSION_COOKIE}={sid}; Path=/; Max-Age=86400; SameSite=Lax")
+                resp.add_header("Set-Cookie",
+                                f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
                 return resp
 
-            resp_headers = _build_response_headers(s_headers_list,
-                                                    is_rewritten=False)
+            resp_headers = _build_response_headers(s_headers_list, is_rewritten=False)
             resp = RawResponse(s_body, status=s_status, content_type=ctype,
                                headers=resp_headers)
-            _add_cookies_to_response(resp, s_headers_list,
-                                     parsed.hostname or "")
+            _add_cookies_to_response(resp, s_headers_list, parsed.hostname or "")
             return resp
 
-    # ================================================================
-    # Raw socket path
-    # ================================================================
+    # -------- Raw socket path --------
     try:
         reader, writer, status, up_headers, first = \
             await _open_upstream_stream(target_url, req.method,
@@ -2432,8 +2410,7 @@ async def serve_proxied(req, target_url, sid):
     except Exception as e:
         log.warning("upstream open failed for %s: %s", target_url, e)
         if wants == "script":
-            resp = RawResponse(_js_stub(0, target_url, b""),
-                               status=200,
+            resp = RawResponse(_js_stub(0, target_url, b""), status=200,
                                content_type="application/javascript; charset=utf-8")
             resp.add_header("Cache-Control", "no-store")
             return resp
@@ -2446,8 +2423,7 @@ async def serve_proxied(req, target_url, sid):
             "Fetch failed",
             f"<b>{esc(type(e).__name__)}</b><br>{esc(str(e))}<br>"
             f"<span style=\"color:#64748b;font-size:.8rem\">"
-            f"target: {esc(target_url)}</span>",
-            502)
+            f"target: {esc(target_url)}</span>", 502)
 
     for sc in _headers_all(up_headers, "set-cookie"):
         try:
@@ -2471,14 +2447,13 @@ async def serve_proxied(req, target_url, sid):
         await _close_writer(writer)
         resp_headers = _verbatim_response_headers(up_headers)
         resp_headers["Content-Type"] = ctype
-        resp = RawResponse(b"", status=status,
-                           content_type=ctype, headers=resp_headers)
+        resp = RawResponse(b"", status=status, content_type=ctype,
+                           headers=resp_headers)
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
     is_binary = _is_media_response(req, target_url, ctype, ext,
                                     status, content_range)
-
     if is_binary:
         resp_headers = _verbatim_response_headers(up_headers)
         resp_headers.setdefault("Content-Type", ctype)
@@ -2503,7 +2478,6 @@ async def serve_proxied(req, target_url, sid):
                 ok = False
                 log.debug("small media read failed: %s: %s", target_url, e)
             await _close_writer(writer)
-
             if ok and len(buf) == expected_len:
                 resp = RawResponse(bytes(buf), status=status,
                                    content_type=ctype, headers=resp_headers)
@@ -2513,11 +2487,8 @@ async def serve_proxied(req, target_url, sid):
 
         body_gen_factory = _make_streaming_body(reader, writer, up_headers,
                                                  first, target_url)
-        return StreamingResponse(
-            body_gen_factory(),
-            content_type=ctype,
-            headers=resp_headers,
-            status=status)
+        return StreamingResponse(body_gen_factory(), content_type=ctype,
+                                 headers=resp_headers, status=status)
 
     if 300 <= status < 400:
         loc = _header(up_headers, "location")
@@ -2551,8 +2522,7 @@ async def serve_proxied(req, target_url, sid):
                 except Exception:
                     pass
                 await _close_writer(writer)
-                resp = RawResponse(_js_stub(status, target_url, b""),
-                                   status=200,
+                resp = RawResponse(_js_stub(status, target_url, b""), status=200,
                                    content_type="application/javascript; charset=utf-8")
                 resp.add_header("Cache-Control", "no-store")
                 _add_cookies_to_response(resp, up_headers, origin_host)
@@ -2611,11 +2581,9 @@ async def serve_proxied(req, target_url, sid):
         except Exception:
             pass
         await _close_writer(writer)
-
         if oversized:
             head_bytes = bytes(buf)
-            resp_headers = _build_response_headers(up_headers,
-                                                    is_rewritten=False)
+            resp_headers = _build_response_headers(up_headers, is_rewritten=False)
             resp_headers.pop("Content-Length", None)
             _add_cookies_to_streaming(resp_headers, up_headers, origin_host)
             async def phls_raw():
@@ -2623,10 +2591,9 @@ async def serve_proxied(req, target_url, sid):
                     yield head_bytes
                 finally:
                     pass
-            return StreamingResponse(
-                phls_raw(),
-                content_type="application/vnd.apple.mpegurl",
-                headers=resp_headers, status=status)
+            return StreamingResponse(phls_raw(),
+                                     content_type="application/vnd.apple.mpegurl",
+                                     headers=resp_headers, status=status)
 
         raw = bytes(buf)
         if ce and ce != "identity":
@@ -2660,8 +2627,7 @@ async def serve_proxied(req, target_url, sid):
             except Exception:
                 pass
             await _close_writer(writer)
-            resp = RawResponse(_js_stub(status, target_url, preview),
-                               status=200,
+            resp = RawResponse(_js_stub(status, target_url, preview), status=200,
                                content_type="application/javascript; charset=utf-8")
             resp.add_header("Cache-Control", "no-store")
             _add_cookies_to_response(resp, up_headers, origin_host)
@@ -2678,8 +2644,7 @@ async def serve_proxied(req, target_url, sid):
             except Exception:
                 pass
             await _close_writer(writer)
-            resp = RawResponse(_js_stub(status, target_url, peek),
-                               status=200,
+            resp = RawResponse(_js_stub(status, target_url, peek), status=200,
                                content_type="application/javascript; charset=utf-8")
             resp.add_header("Cache-Control", "no-store")
             _add_cookies_to_response(resp, up_headers, origin_host)
@@ -2707,8 +2672,7 @@ async def serve_proxied(req, target_url, sid):
             except Exception:
                 pass
             await _close_writer(writer)
-            resp = RawResponse(_js_stub(status, target_url, b""),
-                               status=200,
+            resp = RawResponse(_js_stub(status, target_url, b""), status=200,
                                content_type="application/javascript; charset=utf-8")
             resp.add_header("Cache-Control", "no-store")
             _add_cookies_to_response(resp, up_headers, origin_host)
@@ -2728,9 +2692,7 @@ async def serve_proxied(req, target_url, sid):
             _add_cookies_to_response(resp, up_headers, origin_host)
             return resp
 
-    # ================================================================
-    # HTML (with streaming fix for oversized bodies)
-    # ================================================================
+    # -------- HTML (Bug 4 fix applied) --------
     if (not is_static_asset) and ("text/html" in low_ct
                                    or "application/xhtml" in low_ct):
         buf = bytearray(); rewritable = True
@@ -2746,8 +2708,6 @@ async def serve_proxied(req, target_url, sid):
         raw = bytes(buf)
         hdr_dict = {k: v for k, v in up_headers}
 
-        # Challenge detection works even when oversized — markers appear
-        # in the first few KB regardless of total size.
         if _is_google_sorry(status, hdr_dict, raw, target_url):
             log.warning("google sorry on %s (raw, %d)", target_url, status)
             await _close_writer(writer)
@@ -2786,11 +2746,9 @@ async def serve_proxied(req, target_url, sid):
             sess.page_origin = origin
             ctx = {"upstream": target_url, "sid": sid,
                    "preserve_captcha": True,
-                   "_injected": [s["code"] for s in sess.injected
-                                 if s["enabled"]]}
+                   "_injected": [s["code"] for s in sess.injected if s["enabled"]]}
             body = HTMLRewriter(target_url, ctype, ctx).rewrite(raw)
-            resp_headers = _build_response_headers(up_headers,
-                                                    is_rewritten=True)
+            resp_headers = _build_response_headers(up_headers, is_rewritten=True)
             resp = RawResponse(body, status=status,
                                content_type="text/html; charset=utf-8",
                                headers=resp_headers)
@@ -2801,7 +2759,9 @@ async def serve_proxied(req, target_url, sid):
                             f"{ORIGIN_COOKIE}={quote(origin, safe='')}; Path=/; Max-Age=86400; SameSite=Lax")
             return resp
 
-        # Oversized HTML — do NOT close upstream. Stream the remainder.
+        # Bug 4 fix: oversized HTML — do NOT close upstream. Stream the
+        # remainder from the still-open socket. Pop Content-Length so
+        # chunked encoding wins.
         head_bytes = bytes(buf)
         resp_headers = _build_response_headers(up_headers, is_rewritten=False)
         resp_headers.pop("Content-Length", None)
@@ -2824,9 +2784,7 @@ async def serve_proxied(req, target_url, sid):
                                  content_type="text/html; charset=utf-8",
                                  headers=resp_headers, status=status)
 
-    # ================================================================
-    # CSS (same streaming fix)
-    # ================================================================
+    # -------- CSS (Bug 4 fix applied) --------
     if (not is_static_asset) and "text/css" in low_ct:
         buf = bytearray(); oversized = False
         try:
@@ -2840,8 +2798,7 @@ async def serve_proxied(req, target_url, sid):
 
         if oversized:
             head_bytes = bytes(buf)
-            resp_headers = _build_response_headers(up_headers,
-                                                    is_rewritten=False)
+            resp_headers = _build_response_headers(up_headers, is_rewritten=False)
             resp_headers.pop("Content-Length", None)
             _add_cookies_to_streaming(resp_headers, up_headers, origin_host)
             async def pcss():
@@ -2872,11 +2829,8 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_response(resp, up_headers, origin_host)
         return resp
 
-    # ================================================================
-    # Default passthrough
-    # ================================================================
+    # -------- Default passthrough --------
     resp_headers = _build_response_headers(up_headers, is_rewritten=False)
-
     cl_up = _header(up_headers, "content-length")
     expected_len = None
     if cl_up:
@@ -2890,11 +2844,8 @@ async def serve_proxied(req, target_url, sid):
         _add_cookies_to_streaming(resp_headers, up_headers, origin_host)
         body_gen_factory = _make_streaming_body(reader, writer, up_headers,
                                                  first, target_url)
-        return StreamingResponse(
-            body_gen_factory(),
-            content_type=ctype,
-            headers=resp_headers,
-            status=status)
+        return StreamingResponse(body_gen_factory(), content_type=ctype,
+                                 headers=resp_headers, status=status)
 
     buf = bytearray()
     overflow = False
@@ -2912,7 +2863,6 @@ async def serve_proxied(req, target_url, sid):
 
     if not overflow and read_complete:
         await _close_writer(writer)
-
         buf_len = len(buf)
         if expected_len is not None and buf_len != expected_len:
             log.warning("short read for %s: got %d of %d bytes",
@@ -2978,8 +2928,9 @@ async def serve_proxied(req, target_url, sid):
         finally:
             await _close_writer(writer)
 
-    return StreamingResponse(passthrough(), content_type=ctype, headers=resp_headers, status=status)                             
-
+    return StreamingResponse(passthrough(), content_type=ctype, headers=resp_headers, status=status)
+                             
+                             
 async def _try_proxy_candidates(req, sess, sid, path_only, qs, candidates):
     dest = (req.headers.get("sec-fetch-dest") or "").lower()
     if dest in ("document", "iframe", "frame") and sess.page_origin:

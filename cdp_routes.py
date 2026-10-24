@@ -238,23 +238,17 @@ def is_available():
 
 # ------------------------------------------------------- solve / capture
 async def _solve_async(token, target_url, origin, sid, ctx):
-    """
-    Open the URL in the headless browser, wait for network idle, capture
-    DOM + storage + cookies into a clone artifact.
+    """Open URL in headless browser, wait for network idle, capture DOM+state.
 
-    Deduplicates concurrent calls: if the same target_url is already being
-    solved, the new request chains onto the existing solve's token instead
-    of opening a second tab. Without this, a page with N subresources
-    triggers N solves and exhausts the container's memory.
+    Deduplicates concurrent solves: if the same target_url is already being
+    solved, chain onto the existing token instead of opening a second tab.
     """
-    # --- Dedup ---
     existing = _SOLVE_INFLIGHT.get(target_url)
     if existing and existing != token:
         prior = _SOLVES.get(existing)
         if prior and prior.get("status") == "pending":
             _SOLVES[token] = {"status": "deduplicated", "token": existing}
-            log.debug("cdp: solve %s deduplicated to %s",
-                      token[:8], existing[:8])
+            log.debug("cdp: solve %s deduplicated to %s", token[:8], existing[:8])
             return
 
     _SOLVE_INFLIGHT[target_url] = token
@@ -263,8 +257,7 @@ async def _solve_async(token, target_url, origin, sid, ctx):
         sess = get_session(sid)
         client = CDP_STATE.get("client")
         if not client:
-            _SOLVES[token] = {"status": "error",
-                               "error": "browser not connected"}
+            _SOLVES[token] = {"status": "error", "error": "browser not connected"}
             return
 
         base = target_url.split("?")[0]
@@ -284,8 +277,7 @@ async def _solve_async(token, target_url, origin, sid, ctx):
                     break
 
         if not target:
-            _SOLVES[token] = {"status": "error",
-                               "error": "could not open tab"}
+            _SOLVES[token] = {"status": "error", "error": "could not open tab"}
             return
 
         tid = target["targetId"]
@@ -314,7 +306,6 @@ async def _solve_async(token, target_url, origin, sid, ctx):
     finally:
         if _SOLVE_INFLIGHT.get(target_url) == token:
             _SOLVE_INFLIGHT.pop(target_url, None)
-
 
 def _new_token():
     tok = uuid.uuid4().hex[:12]
@@ -368,20 +359,20 @@ font-family:ui-monospace,monospace;font-size:12px;color:#38bdf8}
     location.href = '/proxy?url=' + encodeURIComponent(TARGET) + '&_t=' + Date.now();
   }
   async function poll(){
-    try {
-      var r = await fetch('/cdp/solve-status/' + TOKEN, {credentials: 'same-origin'});
-      var d = await r.json();
-      if (d.status === 'ready') { st.textContent = 'Captured — reloading…'; reloadNow(); return; }
-      if (d.status === 'deduplicated') {
-        st.textContent = 'Attaching to existing solve…';
-        TOKEN = d.token || TOKEN;
-        setTimeout(poll, 800); return;
-      }
-      if (d.status === 'error') { st.textContent = 'Error: ' + (d.error || 'unknown'); return; }
-      st.textContent = 'Working…';
-    } catch(e) {}
-    setTimeout(poll, 1200);
-  }
+  try {
+    var r = await fetch('/cdp/solve-status/' + TOKEN, {credentials: 'same-origin'});
+    var d = await r.json();
+    if (d.status === 'ready') { st.textContent = 'Captured — reloading…'; reloadNow(); return; }
+    if (d.status === 'deduplicated') {
+      st.textContent = 'Attaching to existing solve…';
+      TOKEN = d.token || TOKEN;
+      setTimeout(poll, 800); return;
+    }
+    if (d.status === 'error') { st.textContent = 'Error: ' + (d.error || 'unknown'); return; }
+    st.textContent = 'Working…';
+  } catch(e) {}
+  setTimeout(poll, 1200);
+}
   setTimeout(poll, 400);
 })();
 </script>
