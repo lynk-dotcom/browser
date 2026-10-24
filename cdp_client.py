@@ -4,7 +4,6 @@ import json
 import logging
 import time
 import urllib.request
-
 import websockets
 
 log = logging.getLogger("lynk.cdp")
@@ -77,8 +76,7 @@ class CDPClient:
 
     def off(self, method, handler):
         self._event_handlers = [
-            (m, h) for m, h in self._event_handlers
-            if not (m == method and h is handler)
+            (m, h) for m, h in self._event_handlers if not (m == method and h is handler)
         ]
 
     async def send(self, method, params=None, session_id=None):
@@ -92,7 +90,8 @@ class CDPClient:
         fut = asyncio.get_event_loop().create_future()
         self._pending[mid] = fut
         await self._ws.send(json.dumps(msg))
-        return await asyncio.wait_for(fut, timeout=60.0)
+        # FIX: raised from 60s to 120s — heavy pages and challenge JS can take longer.
+        return await asyncio.wait_for(fut, timeout=120.0)
 
 
 def _http_json(url, timeout=2.0):
@@ -119,8 +118,7 @@ async def connect_browser(port):
 
 async def attach(client, target_id):
     try:
-        res = await client.send("Target.attachToTarget",
-                                {"targetId": target_id, "flatten": True})
+        res = await client.send("Target.attachToTarget", {"targetId": target_id, "flatten": True})
         return res.get("sessionId")
     except CDPError as e:
         log.warning("attach %s failed: %s", target_id[:8], e)
@@ -130,8 +128,7 @@ async def attach(client, target_id):
 async def get_targets(client):
     res = await client.send("Target.getTargets")
     return [
-        {"targetId": t.get("targetId"), "type": t.get("type"),
-         "url": t.get("url", ""), "title": t.get("title", "")}
+        {"targetId": t.get("targetId"), "type": t.get("type"), "url": t.get("url", ""), "title": t.get("title", "")}
         for t in res.get("targetInfos", [])
         if t.get("type") == "page"
     ]
@@ -153,33 +150,68 @@ async def activate_target(client, target_id):
 async def navigate(client, session, url):
     try:
         await client.send("Page.enable", session_id=session)
+        # FIX: enable Network so wait_ready can observe resource activity.
+        await client.send("Network.enable", session_id=session)
     except CDPError:
         pass
     return await client.send("Page.navigate", {"url": url}, session_id=session)
 
 
-async def wait_ready(client, session, timeout=30.0):
+async def wait_ready(client, session, timeout=90.0):
+    """Wait for document ready + network idle (no new resources for 2s).
+
+    FIX: the original only checked document.readyState and used a 30s default.
+    That returns before Cloudflare / reCAPTCHA scripts have finished loading
+    and before challenge iframes have populated. This version waits until the
+    page is complete *and* the resource count has been stable for 2 seconds.
+    """
     deadline = time.time() + timeout
+    last_resource_count = -1
+    stable_since = None
+
     while time.time() < deadline:
         try:
             state = await client.send(
                 "Runtime.evaluate",
                 {"expression": "document.readyState", "returnByValue": True},
-                session_id=session)
-            if state.get("result", {}).get("value") == "complete":
-                return True
+                session_id=session,
+            )
+            ready = state.get("result", {}).get("value") == "complete"
+
+            count_res = await client.send(
+                "Runtime.evaluate",
+                {
+                    "expression": "performance.getEntriesByType('resource').length",
+                    "returnByValue": True,
+                },
+                session_id=session,
+            )
+            count = count_res.get("result", {}).get("value") or 0
+
+            if ready:
+                if count == last_resource_count:
+                    if stable_since is None:
+                        stable_since = time.time()
+                    elif time.time() - stable_since >= 2.0:
+                        return True
+                else:
+                    stable_since = None
+                    last_resource_count = count
         except Exception:
             pass
+
         await asyncio.sleep(0.5)
+
     return False
 
 
-async def evaluate(client, session, js, await_promise=True, return_by_value=True, timeout=60.0):
-    res = await client.send("Runtime.evaluate", {
-        "expression": js,
-        "awaitPromise": await_promise,
-        "returnByValue": return_by_value,
-    }, session_id=session)
+async def evaluate(client, session, js, await_promise=True, return_by_value=True, timeout=120.0):
+    # FIX: default timeout raised from 60s to 120s.
+    res = await client.send(
+        "Runtime.evaluate",
+        {"expression": js, "awaitPromise": await_promise, "returnByValue": return_by_value},
+        session_id=session,
+    )
     if "exceptionDetails" in res:
         raise CDPError(str(res["exceptionDetails"].get("text", "JS exception")))
     return res.get("result", {}).get("value")
@@ -217,12 +249,11 @@ async def get_storage(client, session, origin, kind):
         await client.send("DOMStorage.enable", session_id=session)
     except CDPError:
         pass
-    res = await client.send("DOMStorage.getDOMStorageItems", {
-        "storageId": {
-            "securityOrigin": origin,
-            "isLocalStorage": kind == "localStorage",
-        }
-    }, session_id=session)
+    res = await client.send(
+        "DOMStorage.getDOMStorageItems",
+        {"storageId": {"securityOrigin": origin, "isLocalStorage": kind == "localStorage"}},
+        session_id=session,
+    )
     out = {}
     for item in res.get("entries", []):
         if isinstance(item, list) and len(item) == 2:

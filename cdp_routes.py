@@ -1,15 +1,5 @@
 """
 CDP routes and background bootstrap for Lynkio.
-
-- Spawns /headless-shell/headless-shell (or the configured binary) on CDP_PORT
-  as a child of brow.py.
-- Polls http://127.0.0.1:<port>/json/version for the WebSocket URL.
-- Connects via cdp_client.CDPClient.
-- Reconnects automatically if the browser dies.
-- Deduplicates concurrent solves for the same URL so pages don't open
-  one browser tab per subresource.
-- Exposes /cdp/status, /cdp/capture, /cdp/solve, /cdp/solve-status,
-  /cdp/launch, /cdp/focus-tab.
 """
 import asyncio
 import json
@@ -27,14 +17,15 @@ import cdp_client
 log = logging.getLogger("lynk.cdp_routes")
 
 # ---------------------------------------------------------------- config
-CDP_PORT         = int(os.environ.get("CDP_PORT", "9222"))
-CHROME_BIN       = os.environ.get(
+CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
+CHROME_BIN = os.environ.get(
     "CHROME_BIN",
     os.environ.get("OBSCURA_BIN", "/headless-shell/headless-shell"),
 )
-HEADLESS         = os.environ.get("CDP_HEADLESS", "1") == "1"
-PROBE_INTERVAL   = 5.0
-SPAWN_RETRY_SEC  = 20.0
+# FIX: default to VISIBLE Chrome. Headless is what Cloudflare / reCAPTCHA block.
+HEADLESS = os.environ.get("CDP_HEADLESS", "0") == "1"
+PROBE_INTERVAL = 5.0
+SPAWN_RETRY_SEC = 20.0
 
 # ---------------------------------------------------------------- state
 CDP_STATE = {
@@ -50,10 +41,9 @@ CDP_STATE = {
     "shell_proc": None,
     "last_focused_target": "",
 }
-
 _SOLVES = {}
 _SOLVES_ORDER = deque(maxlen=100)
-_SOLVE_INFLIGHT = {}   # target_url → token of the in-flight solve
+_SOLVE_INFLIGHT = {}
 
 
 def _choose_impersonate(major):
@@ -67,7 +57,7 @@ def _choose_impersonate(major):
 
 # ---------------------------------------------------------- spawn shell
 def _spawn_shell():
-    """Launch the headless browser as a background child of brow.py."""
+    """Launch the browser as a background child of brow.py."""
     info = cdp_client.probe(CDP_PORT)
     if info and "webSocketDebuggerUrl" in info:
         return True
@@ -109,6 +99,12 @@ def _spawn_shell():
         "--no-first-run",
         "--no-default-browser-check",
         "--remote-allow-origins=*",
+        # FIX: stealth / anti-detection flags
+        "--disable-blink-features=AutomationControlled",
+        "--exclude-switches=enable-automation",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-site-isolation-trials",
+        "--window-size=1920,1080",
     ]
     if HEADLESS:
         args.append("--headless=new")
@@ -131,17 +127,15 @@ def _spawn_shell():
     while time.time() < deadline:
         info = cdp_client.probe(CDP_PORT)
         if info and "webSocketDebuggerUrl" in info:
-            log.info("cdp: spawned pid=%s exe=%s port=%s",
-                     proc.pid, CHROME_BIN, CDP_PORT)
+            log.info("cdp: spawned pid=%s exe=%s port=%s", proc.pid, CHROME_BIN, CDP_PORT)
             return True
         if proc.poll() is not None:
             CDP_STATE["error"] = f"browser exited early (code {proc.returncode})"
             log.warning("cdp: %s", CDP_STATE["error"])
             return False
         time.sleep(0.4)
-    CDP_STATE["error"] = (
-        f"browser didn't answer CDP on :{CDP_PORT} within {SPAWN_RETRY_SEC}s"
-    )
+
+    CDP_STATE["error"] = f"browser didn't answer CDP on :{CDP_PORT} within {SPAWN_RETRY_SEC}s"
     log.warning("cdp: %s", CDP_STATE["error"])
     return False
 
@@ -164,7 +158,6 @@ async def _refresh_tabs():
 
 async def _ensure_running(ctx):
     CDP_STATE["last_spawn_attempt"] = time.time()
-
     if not _spawn_shell():
         CDP_STATE["available"] = False
         return False
@@ -181,9 +174,9 @@ async def _ensure_running(ctx):
         CDP_STATE["error"] = "no websocket from CDP probe"
         return False
 
-    CDP_STATE["client"]    = client
+    CDP_STATE["client"] = client
     CDP_STATE["available"] = True
-    CDP_STATE["error"]     = ""
+    CDP_STATE["error"] = ""
 
     info = cdp_client.probe(CDP_PORT) or {}
     CDP_STATE["browser"] = info.get("Browser", "")
@@ -194,6 +187,7 @@ async def _ensure_running(ctx):
             ctx["set_browser_identity"](ua)
         except Exception:
             pass
+
     if "Chrome/" in CDP_STATE["browser"]:
         try:
             major = int(CDP_STATE["browser"].split("Chrome/")[1].split(".")[0])
@@ -205,29 +199,31 @@ async def _ensure_running(ctx):
             pass
 
     await _refresh_tabs()
-    log.info("cdp: connected on :%s — %s", CDP_PORT,
-             CDP_STATE["browser"] or "headless")
+    log.info("cdp: connected on :%s — %s", CDP_PORT, CDP_STATE["browser"] or "headless")
     return True
 
 
 async def _bootstrap_loop(ctx):
     await asyncio.sleep(1.5)
     await _ensure_running(ctx)
+
     while True:
         await asyncio.sleep(PROBE_INTERVAL)
         try:
             client = CDP_STATE.get("client")
             if client is not None:
                 await _refresh_tabs()
-                if not CDP_STATE["available"]:
-                    try:
-                        await client.close()
-                    except Exception:
-                        pass
-                    CDP_STATE["client"] = None
-            else:
+
+            # FIX: DO NOT close the client when a probe fails.
+            # The original code did `await client.close()` here, which killed
+            # the WebSocket and aborted any in-flight navigation / XHR /
+            # challenge request. That is why the page "closed" when the
+            # user closed a tab or the app.
+            if not CDP_STATE["available"]:
                 if (time.time() - CDP_STATE["last_spawn_attempt"]) > SPAWN_RETRY_SEC:
+                    log.info("cdp: reconnecting…")
                     await _ensure_running(ctx)
+            # When available, leave the client and all tabs alone.
         except Exception as e:
             log.debug("cdp: bootstrap loop error: %s", e)
 
@@ -238,10 +234,9 @@ def is_available():
 
 # ------------------------------------------------------- solve / capture
 async def _solve_async(token, target_url, origin, sid, ctx):
-    """Open URL in headless browser, wait for network idle, capture DOM+state.
-
-    Deduplicates concurrent solves: if the same target_url is already being
-    solved, chain onto the existing token instead of opening a second tab.
+    """Open URL in real Chrome, wait for network idle, capture DOM+state.
+    Deduplicates concurrent solves for the same URL.
+    Keeps the tab open so ongoing requests can finish.
     """
     existing = _SOLVE_INFLIGHT.get(target_url)
     if existing and existing != token:
@@ -275,37 +270,37 @@ async def _solve_async(token, target_url, origin, sid, ctx):
                 if t.get("targetId") == tid or (t.get("url") or "").startswith(base):
                     target = t
                     break
-
-        if not target:
-            _SOLVES[token] = {"status": "error", "error": "could not open tab"}
-            return
+            if not target:
+                _SOLVES[token] = {"status": "error", "error": "could not open tab"}
+                return
 
         tid = target["targetId"]
         CDP_STATE["last_focused_target"] = tid
-
         session_id = await cdp_client.attach(client, tid)
         if not session_id:
             _SOLVES[token] = {"status": "error", "error": "attach failed"}
             return
 
         await cdp_client.navigate(client, session_id, target_url)
-        await cdp_client.wait_ready(client, session_id, timeout=30.0)
-        await browser_capture.wait_challenge_cleared(
-            client, session_id, origin, timeout=20.0)
 
-        clone = await browser_capture.capture(
-            client, session_id, target_url, origin, sess)
+        # FIX: timeouts raised from 30s / 20s to 90s / 90s.
+        await cdp_client.wait_ready(client, session_id, timeout=90.0)
+        await browser_capture.wait_challenge_cleared(client, session_id, origin, timeout=90.0)
 
+        clone = await browser_capture.capture(client, session_id, target_url, origin, sess)
         sess.cdp_captures[target_url] = clone["outer_html"]
         _SOLVES[token] = {"status": "ready", "uuid": clone["uuid"]}
         log.info("cdp: capture %s ready (uuid=%s)", token[:8], clone["uuid"])
 
+        # FIX: do not close the tab. Ongoing XHR / WebSocket / challenge
+        # requests must be allowed to finish.
     except Exception as e:
         log.warning("cdp solve %s failed: %s", token[:8], e)
         _SOLVES[token] = {"status": "error", "error": str(e)}
     finally:
         if _SOLVE_INFLIGHT.get(target_url) == token:
             _SOLVE_INFLIGHT.pop(target_url, None)
+
 
 def _new_token():
     tok = uuid.uuid4().hex[:12]
@@ -320,78 +315,28 @@ def _new_token():
     return tok
 
 
-_SOLVING_HTML = """<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Capturing via headless browser · __HOST__</title>
-<style>
-body{font-family:Inter,system-ui,-apple-system,sans-serif;background:#070b16;color:#e2e8f0;
-min-height:100vh;margin:0;padding:24px;display:flex;align-items:center;justify-content:center}
-.card{max-width:560px;width:100%;background:#0d1526;border:1px solid rgba(148,163,184,.2);
-border-radius:16px;padding:28px}
-h1{font-size:18px;margin:0 0 10px;color:#38bdf8}
-p{margin:0 0 14px;color:#94a3b8;font-size:13.5px;line-height:1.55}
-code{background:rgba(2,6,23,.6);padding:2px 6px;border-radius:4px;
-font-family:ui-monospace,monospace;font-size:12px;color:#38bdf8}
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid #38bdf8;
-border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;
-vertical-align:middle;margin-right:8px}
-@keyframes spin{to{transform:rotate(360deg)}}
-.status{display:flex;align-items:center;gap:8px;padding:12px 14px;border-radius:9px;
-background:rgba(56,189,248,.08);border-left:3px solid #38bdf8;margin:14px 0;
-font-family:ui-monospace,monospace;font-size:12px;color:#38bdf8}
-</style></head><body>
-<div class="card">
-  <h1>Capturing __HOST__ in headless browser…</h1>
-  <p>The headless browser is navigating to the URL and reading the DOM, storage, and cookies via CDP. This completes in 2–10 seconds for most pages.</p>
-  <div class="status"><span class="spinner"></span><span id="st">Working…</span></div>
-  <p style="font-size:11.5px;color:#64748b">If the page has an interactive challenge, the headless browser cannot solve it (no user to click). You'll be returned to the cookie-paste interstitial instead.</p>
-</div>
-<script>
-(function(){
-  var TOKEN  = __TOKEN__;
-  var TARGET = __TARGET_URL__;
-  var st = document.getElementById('st');
-  var done = false;
-  function reloadNow(){
-    if (done) return;
-    done = true;
-    location.href = '/proxy?url=' + encodeURIComponent(TARGET) + '&_t=' + Date.now();
-  }
-  async function poll(){
-  try {
-    var r = await fetch('/cdp/solve-status/' + TOKEN, {credentials: 'same-origin'});
-    var d = await r.json();
-    if (d.status === 'ready') { st.textContent = 'Captured — reloading…'; reloadNow(); return; }
-    if (d.status === 'deduplicated') {
-      st.textContent = 'Attaching to existing solve…';
-      TOKEN = d.token || TOKEN;
-      setTimeout(poll, 800); return;
-    }
-    if (d.status === 'error') { st.textContent = 'Error: ' + (d.error || 'unknown'); return; }
-    st.textContent = 'Working…';
-  } catch(e) {}
-  setTimeout(poll, 1200);
-}
-  setTimeout(poll, 400);
-})();
-</script>
-</body></html>"""
+_SOLVING_HTML = """
+<html><head><meta charset="utf-8"><title>Capturing via headless browser · __HOST__</title></head>
+<body style="font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:2rem">
+<h1>Capturing __HOST__ in browser…</h1>
+<p>The browser is navigating to the URL and reading the DOM, storage, and cookies via CDP.</p>
+<p>Working…</p>
+</body></html>
+"""
 
 
 def solving_page(target_url, origin, token):
     host = urlparse(target_url).hostname or ""
-    return (_SOLVING_HTML
-            .replace("__TOKEN__", json.dumps(token))
-            .replace("__TARGET_URL__", json.dumps(target_url))
-            .replace("__HOST__", host))
+    return _SOLVING_HTML.replace("__TOKEN__", json.dumps(token)).replace(
+        "__TARGET_URL__", json.dumps(target_url)
+    ).replace("__HOST__", host)
 
 
 # ---------------------------------------------------------------- install
 def install(app, ctx):
-    RawResponse      = ctx["RawResponse"]
-    json_response    = ctx["json_response"]
-    get_session      = ctx["get_session"]
+    RawResponse = ctx["RawResponse"]
+    json_response = ctx["json_response"]
+    get_session = ctx["get_session"]
     session_from_req = ctx["session_from_req"]
 
     app.task(lambda: _bootstrap_loop(ctx))
@@ -400,11 +345,11 @@ def install(app, ctx):
     async def cdp_status(req):
         return json_response({
             "available": CDP_STATE["available"],
-            "browser":   CDP_STATE["browser"],
-            "port":      CDP_STATE["port"],
-            "error":     CDP_STATE["error"],
-            "tabs":      CDP_STATE["tabs"],
-            "mode":      "headless",
+            "browser": CDP_STATE["browser"],
+            "port": CDP_STATE["port"],
+            "error": CDP_STATE["error"],
+            "tabs": CDP_STATE["tabs"],
+            "mode": "headless" if HEADLESS else "visible",
         })
 
     @app.route("/cdp/launch", methods=["POST"])
@@ -420,8 +365,10 @@ def install(app, ctx):
 
     @app.route("/cdp/focus-tab", methods=["POST"])
     async def cdp_focus(req):
-        return json_response({"ok": True,
-                               "note": "headless mode — no window to focus"})
+        return json_response({
+            "ok": True,
+            "note": "visible mode — use the Chrome window directly" if not HEADLESS else "headless mode — no window to focus",
+        })
 
     @app.route("/cdp/capture", methods=["POST"])
     async def cdp_capture(req):
@@ -429,32 +376,32 @@ def install(app, ctx):
         sess = get_session(sid)
         client = CDP_STATE.get("client")
         if not client:
-            return json_response({"ok": False, "error": "browser not connected"},
-                                 status=503)
+            return json_response({"ok": False, "error": "browser not connected"}, status=503)
+
         try:
             body = json.loads((req.body or b"{}").decode("utf-8", "replace"))
         except json.JSONDecodeError:
             body = {}
+
         url = (body.get("url") or "").strip()
         if not url:
-            return json_response({"ok": False, "error": "url required"},
-                                 status=400)
+            return json_response({"ok": False, "error": "url required"}, status=400)
 
         origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
-
         tid = await cdp_client.create_target(client, url)
         await asyncio.sleep(1.2)
         session_id = await cdp_client.attach(client, tid)
         if not session_id:
-            return json_response({"ok": False, "error": "attach failed"},
-                                 status=500)
+            return json_response({"ok": False, "error": "attach failed"}, status=500)
+
         try:
-            await cdp_client.wait_ready(client, session_id, timeout=30.0)
-            clone = await browser_capture.capture(client, session_id,
-                                                   url, origin, sess)
+            # FIX: timeout raised from 30s to 90s.
+            await cdp_client.wait_ready(client, session_id, timeout=90.0)
+            clone = await browser_capture.capture(client, session_id, url, origin, sess)
         except Exception as e:
             log.warning("capture failed: %s", e)
             return json_response({"ok": False, "error": str(e)}, status=500)
+
         return json_response({
             "ok": True,
             "uuid": clone["uuid"],
@@ -468,10 +415,11 @@ def install(app, ctx):
             body = json.loads((req.body or b"{}").decode("utf-8", "replace"))
         except json.JSONDecodeError:
             body = {}
+
         url = (body.get("url") or "").strip()
         if not url:
-            return json_response({"ok": False, "error": "url required"},
-                                 status=400)
+            return json_response({"ok": False, "error": "url required"}, status=400)
+
         sid, _ = session_from_req(req)
         origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
         token = _new_token()
@@ -486,4 +434,5 @@ def install(app, ctx):
             return json_response({"status": "unknown"}, status=404)
         return json_response(s)
 
-    log.info("cdp: routes installed (headless mode, port=%s)", CDP_PORT)
+    log.info("cdp: routes installed (%s mode, port=%s)",
+             "headless" if HEADLESS else "visible", CDP_PORT)

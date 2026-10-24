@@ -70,20 +70,35 @@ TEMPLATES_DIR = os.path.join(HERE, "templates")
 HOST              = "0.0.0.0"
 PORT              = 8080
 
-CONNECT_TIMEOUT   = 8.0
-SSL_HANDSHAKE_TL  = 8.0
-HEADER_TIMEOUT    = 40.0
-BODY_IDLE_TIMEOUT = 120.0
+CONNECT_TIMEOUT   = 15.0
+SSL_HANDSHAKE_TL  = 15.0
+# FIX: raise timeouts so slow upstreams and long-polling challenges finish.
+HEADER_TIMEOUT    = 120.0
+BODY_IDLE_TIMEOUT = 600.0
 DOH_TIMEOUT       = 5.0
 
-MAX_REWRITE_BYTES = 8 * 1024 * 1024
-MAX_CSS_BYTES     = 4 * 1024 * 1024
-MAX_HLS_BYTES     = 2 * 1024 * 1024
-MAX_HEADER_BYTES  = 128 * 1024
-MAX_BUFFER_BYTES  = 8 * 1024 * 1024
+# FIX: raise size caps so large modern pages (Coinbase, Facebook, Next.js
+# bundles with 5–15 MB of inline __NEXT_DATA__ JSON) are fully rewritten
+# instead of being truncated to the passthrough path.
+MAX_REWRITE_BYTES = 64 * 1024 * 1024
+MAX_CSS_BYTES     = 32 * 1024 * 1024
+MAX_HLS_BYTES     = 32 * 1024 * 1024
+MAX_HEADER_BYTES  = 512 * 1024
+MAX_BUFFER_BYTES  = 64 * 1024 * 1024
 
-STREAM_CHUNK_SIZE = 64 * 1024
-SMALL_MEDIA_MAX   = 1 * 1024 * 1024
+STREAM_CHUNK_SIZE = 256 * 1024
+SMALL_MEDIA_MAX   = 8 * 1024 * 1024
+
+# FIX: CSP headers must never reach the client. The proxy rewrites URLs, so
+# any CSP the upstream page ships (or Cloudflare injects on its behalf) will
+# block every proxied script/image/font/iframe even though the proxy itself
+# is trusted. Strip them by name at every header-assembly point.
+_CSP_HEADER_NAMES = frozenset({
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "x-content-security-policy",
+    "x-webkit-csp",
+})
 
 SESSION_TTL_SECONDS   = 6 * 3600
 SESSION_MAX           = 5000
@@ -1024,6 +1039,19 @@ class HTMLRewriter:
             if (meta.get("http-equiv") or "").lower().startswith("content-security"):
                 meta.decompose()
 
+        # FIX: remove sandbox="" from every iframe. reCAPTCHA, hCaptcha,
+        # Cloudflare Turnstile and every other challenge widget rely on
+        # postMessage between the iframe and the parent document. That
+        # requires BOTH allow-scripts AND allow-same-origin. If the source
+        # page ships a restrictive sandbox, the captcha can never verify —
+        # which is exactly the "checkbox loads but never completes" symptom.
+        # The proxy's own CSP has already been removed above, so we are not
+        # weakening the sandbox boundary that matters — we are only removing
+        # an attribute the upstream injected to break widgets it doesn't own.
+        for iframe in soup.find_all("iframe"):
+            if iframe.get("sandbox") is not None:
+                del iframe["sandbox"]
+
         for tag in soup.find_all(["a", "link", "area"], href=True):
             h = tag["href"]
             if skip_url(h):
@@ -1788,6 +1816,10 @@ def _build_response_headers(up_headers_list, is_rewritten):
         kl = k.lower()
         if kl in NEVER_EMIT:
             continue
+        # FIX: strip every form of Content-Security-Policy. Without this,
+        # Cloudflare / site-shipped CSP blocks all proxied sub-resources.
+        if kl in _CSP_HEADER_NAMES:
+            continue
         if kl == "location":
             continue
         if kl == "set-cookie":
@@ -1815,6 +1847,11 @@ def _verbatim_response_headers(up_headers_list):
         kl = k.lower()
         if kl in _HOP_BY_HOP:
             continue
+        # FIX: strip CSP at this path too. This function is used for binary
+        # passthrough, HEAD, and the oversized-HTML stream fallback — all of
+        # which would otherwise forward the upstream CSP header verbatim.
+        if kl in _CSP_HEADER_NAMES:
+            continue
         if kl == "location":
             continue
         if kl == "set-cookie":
@@ -1828,7 +1865,7 @@ def _verbatim_response_headers(up_headers_list):
         else:
             out[kl] = v
     return out
-
+    
 
 def _add_cookies_to_response(resp, up_headers_list, origin_host):
     for sc in _headers_all(up_headers_list, "set-cookie"):

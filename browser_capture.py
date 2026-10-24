@@ -10,7 +10,6 @@ import cloner
 
 log = logging.getLogger("lynk.capture")
 
-
 DUMP_INDEXEDDB_JS = r"""
 (async function(){
   if (typeof indexedDB === 'undefined') return {};
@@ -110,8 +109,11 @@ DUMP_CACHES_JS = r"""
       try {
         var buf = await resp.clone().arrayBuffer();
         entries.push({
-          url: reqs[j].url, method: reqs[j].method, status: resp.status,
-          headers: Array.from(resp.headers.entries()), body_b64: abToB64(buf)
+          url: reqs[j].url,
+          method: reqs[j].method,
+          status: resp.status,
+          headers: Array.from(resp.headers.entries()),
+          body_b64: abToB64(buf)
         });
       } catch(e) {}
     }
@@ -138,8 +140,7 @@ DUMP_OPFS_JS = r"""
       if (handle.kind === 'file'){
         try {
           var file = await handle.getFile(), buf = await file.arrayBuffer();
-          result.entries[name] = {type:'file', body_b64: abToB64(buf),
-            mimeType: file.type||'', lastModified: file.lastModified||0};
+          result.entries[name] = {type:'file', body_b64: abToB64(buf), mimeType: file.type||'', lastModified: file.lastModified||0};
         } catch(e) {}
       } else {
         try { result.entries[name] = await walk(handle); } catch(e) {}
@@ -174,8 +175,7 @@ DUMP_GLOBALS_JS = r"""
   for (var i = 0; i < keys.length; i++){
     var k = keys[i];
     if (SKIP[k] || !k) continue;
-    if (k.indexOf('__lynk') === 0 || k.indexOf('webkit') === 0 ||
-        k.indexOf('moz') === 0) continue;
+    if (k.indexOf('__lynk') === 0 || k.indexOf('webkit') === 0 || k.indexOf('moz') === 0) continue;
     if (k.charAt(0) === 'o' && k.charAt(1) === 'n') continue;
     try {
       var v = window[k];
@@ -205,7 +205,8 @@ def _scheme(origin):
         return "https"
 
 
-async def wait_challenge_cleared(client, session, origin, timeout=30.0):
+async def wait_challenge_cleared(client, session, origin, timeout=90.0):
+    """FIX: default raised from 30s to 90s and checks body length as a fallback."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -215,55 +216,75 @@ async def wait_challenge_cleared(client, session, origin, timeout=30.0):
                 return True
         except Exception:
             pass
+
         try:
             body_len = await cdp_client.evaluate(
-                client, session,
-                "document.body ? document.body.innerText.length : 0",
-                await_promise=False)
+                client, session, "document.body ? document.body.innerText.length : 0", await_promise=False
+            )
             if body_len and body_len > 200:
                 return True
         except Exception:
             pass
+
         await asyncio.sleep(0.8)
     return False
 
 
 async def capture(client, session, url, origin, sess=None):
     try:
-        cur = await cdp_client.evaluate(client, session, "location.href",
-                                        await_promise=False)
+        cur = await cdp_client.evaluate(client, session, "location.href", await_promise=False)
     except Exception:
         cur = ""
+
     if cur != url:
         await cdp_client.navigate(client, session, url)
-        await cdp_client.wait_ready(client, session, timeout=30.0)
-        await asyncio.sleep(2.5)
 
-    await wait_challenge_cleared(client, session, origin)
+    # FIX: wait for network idle (resource count stable for 2s), not just readyState.
+    await cdp_client.wait_ready(client, session, timeout=90.0)
 
-    html          = await cdp_client.get_html(client, session)
-    raw_cookies   = await cdp_client.get_cookies(client, session)
+    # FIX: give challenge JS / iframe loaders more time (was 2.5s).
+    await asyncio.sleep(5.0)
+    await wait_challenge_cleared(client, session, origin, timeout=90.0)
+
+    html = await cdp_client.get_html(client, session)
+    raw_cookies = await cdp_client.get_cookies(client, session)
+
     ls = ss = {}
     idb = caches_dump = {}
     opfs = None
     globals_dump = {}
     ua = ""
-    try: ls = await cdp_client.get_storage(client, session, origin, "localStorage")
-    except Exception as e: log.debug("localStorage: %s", e)
-    try: ss = await cdp_client.get_storage(client, session, origin, "sessionStorage")
-    except Exception as e: log.debug("sessionStorage: %s", e)
-    try: idb = await cdp_client.evaluate(client, session, DUMP_INDEXEDDB_JS, timeout=90.0)
-    except Exception as e: log.debug("IDB: %s", e)
-    try: caches_dump = await cdp_client.evaluate(client, session, DUMP_CACHES_JS, timeout=90.0)
-    except Exception as e: log.debug("caches: %s", e)
-    try: opfs = await cdp_client.evaluate(client, session, DUMP_OPFS_JS, timeout=90.0)
-    except Exception as e: log.debug("OPFS: %s", e)
-    try: globals_dump = await cdp_client.evaluate(client, session, DUMP_GLOBALS_JS, await_promise=False)
-    except Exception as e: log.debug("globals: %s", e)
-    try: ua = await cdp_client.evaluate(client, session, "navigator.userAgent", await_promise=False)
-    except Exception: pass
 
-    host   = _host(origin)
+    try:
+        ls = await cdp_client.get_storage(client, session, origin, "localStorage")
+    except Exception as e:
+        log.debug("localStorage: %s", e)
+    try:
+        ss = await cdp_client.get_storage(client, session, origin, "sessionStorage")
+    except Exception as e:
+        log.debug("sessionStorage: %s", e)
+    try:
+        idb = await cdp_client.evaluate(client, session, DUMP_INDEXEDDB_JS, timeout=90.0)
+    except Exception as e:
+        log.debug("IDB: %s", e)
+    try:
+        caches_dump = await cdp_client.evaluate(client, session, DUMP_CACHES_JS, timeout=90.0)
+    except Exception as e:
+        log.debug("caches: %s", e)
+    try:
+        opfs = await cdp_client.evaluate(client, session, DUMP_OPFS_JS, timeout=90.0)
+    except Exception as e:
+        log.debug("OPFS: %s", e)
+    try:
+        globals_dump = await cdp_client.evaluate(client, session, DUMP_GLOBALS_JS, await_promise=False)
+    except Exception as e:
+        log.debug("globals: %s", e)
+    try:
+        ua = await cdp_client.evaluate(client, session, "navigator.userAgent", await_promise=False)
+    except Exception:
+        pass
+
+    host = _host(origin)
     scheme = _scheme(origin)
     server_cookies = {}
     for c in raw_cookies:
@@ -273,56 +294,60 @@ async def capture(client, session, url, origin, sess=None):
         if host == domain or host.endswith("." + domain):
             origin_key = f"{scheme}://{domain}"
             server_cookies.setdefault(origin_key, {})[c["name"]] = {
-                "value":    c.get("value", ""),
-                "path":     c.get("path", "/"),
-                "domain":   c.get("domain", ""),
-                "secure":   c.get("secure", False),
+                "value": c.get("value", ""),
+                "path": c.get("path", "/"),
+                "domain": c.get("domain", ""),
+                "secure": c.get("secure", False),
                 "httponly": c.get("httpOnly", False),
                 "samesite": c.get("sameSite", ""),
-                "expires":  c.get("expires", 0),
+                "expires": c.get("expires", 0),
             }
 
     parsed = urlparse(url)
     clone = {
-        "uuid":           uuid.uuid4().hex[:16],
-        "created_at":     time.time(),
-        "source_url":     url,
-        "page_origin":    origin,
-        "final_path":     parsed.path or "/",
+        "uuid": uuid.uuid4().hex[:16],
+        "created_at": time.time(),
+        "source_url": url,
+        "page_origin": origin,
+        "final_path": parsed.path or "/",
         "server_cookies": server_cookies,
         "injected": [
-            {"id": s["id"], "name": s["name"],
-             "code": s["code"], "enabled": s["enabled"]}
+            {"id": s["id"], "name": s["name"], "code": s["code"], "enabled": s["enabled"]}
             for s in (sess.injected if sess else [])
         ],
-        "history":        list(sess.history)[-300:] if sess else [],
+        "history": list(sess.history)[-300:] if sess else [],
         "recent_origins": [[o, t] for o, t in (sess.recent_origins if sess else [])],
-        "outer_html":     html,
-        "local_storage":  ls,
+        "outer_html": html,
+        "local_storage": ls,
         "session_storage": ss,
         "document_cookies": "",
-        "indexeddb":      idb,
-        "caches":         caches_dump,
-        "opfs":           opfs,
-        "dom_state":      {},
-        "globals":        globals_dump,
-        "user_agent":     ua,
-        "viewport":       {},
+        "indexeddb": idb,
+        "caches": caches_dump,
+        "opfs": opfs,
+        "dom_state": {},
+        "globals": globals_dump,
+        "user_agent": ua,
+        "viewport": {},
         "turnstile_token": "",
-        "edit_count":     0,
-        "last_edit_ts":   0,
+        "edit_count": 0,
+        "last_edit_ts": 0,
     }
+
     cloner.save_clone(clone)
 
     if sess is not None:
         for origin_key, jar in server_cookies.items():
             for name, attrs in jar.items():
                 try:
-                    sess.cookies.set(origin_key, name, attrs["value"],
-                                     path=attrs.get("path", "/"),
-                                     secure=attrs.get("secure", False),
-                                     httponly=attrs.get("httponly", False),
-                                     samesite=attrs.get("samesite", ""))
+                    sess.cookies.set(
+                        origin_key,
+                        name,
+                        attrs["value"],
+                        path=attrs.get("path", "/"),
+                        secure=attrs.get("secure", False),
+                        httponly=attrs.get("httponly", False),
+                        samesite=attrs.get("samesite", ""),
+                    )
                 except Exception:
                     pass
 

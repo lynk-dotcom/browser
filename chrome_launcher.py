@@ -35,7 +35,6 @@ CHROME_PATHS = {
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
     ],
 }
-
 DEBUG_PORTS = list(range(9222, 9243))
 
 
@@ -45,8 +44,7 @@ def find_browser():
     for candidate in CHROME_PATHS.get(key, []):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    for name in ("google-chrome", "chromium", "chromium-browser",
-                 "brave", "brave-browser", "chrome"):
+    for name in ("google-chrome", "chromium", "chromium-browser", "brave", "brave-browser", "chrome"):
         p = shutil.which(name)
         if p:
             return p
@@ -82,7 +80,8 @@ def detect_running():
 
 
 def launch(profile_dir, force_port=None):
-    """Launch Chromium with container-safe flags. Returns (ok, port, msg, proc)."""
+    """Launch Chromium with container-safe, stealth-friendly flags.
+    Returns (ok, port, msg, proc)."""
     existing = detect_running()
     if existing:
         port, info = existing
@@ -98,10 +97,14 @@ def launch(profile_dir, force_port=None):
         if os.path.islink(exe):
             target = os.path.realpath(exe)
             if "/snap/" in target:
-                return (False, 0,
-                        f"{exe} is a snap stub → {target}. "
-                        f"Snap does not work in Docker. Use Debian 12 chromium "
-                        f"or google-chrome-stable.", None)
+                return (
+                    False,
+                    0,
+                    f"{exe} is a snap stub → {target}. "
+                    f"Snap does not work in Docker. Use Debian 12 chromium "
+                    f"or google-chrome-stable.",
+                    None,
+                )
     except Exception:
         pass
 
@@ -125,7 +128,9 @@ def launch(profile_dir, force_port=None):
     env = dict(os.environ)
     env["HOME"] = home
 
-    headless = os.environ.get("CDP_HEADLESS", "1") != "0"
+    # FIX: default to VISIBLE Chrome (headless is what Cloudflare blocks).
+    headless = os.environ.get("CDP_HEADLESS", "0") != "0"
+
     args = [
         exe,
         f"--remote-debugging-port={port}",
@@ -147,6 +152,13 @@ def launch(profile_dir, force_port=None):
         "--disable-translate",
         "--disable-extensions",
         "--mute-audio",
+        # FIX: stealth / anti-detection flags for Cloudflare / reCAPTCHA
+        "--disable-blink-features=AutomationControlled",
+        "--exclude-switches=enable-automation",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-site-isolation-trials",
+        "--window-size=1920,1080",
+        "--start-maximized",
     ]
     if headless:
         args.append("--headless=new")
@@ -163,19 +175,22 @@ def launch(profile_dir, force_port=None):
     except Exception as e:
         return False, 0, f"Launch failed: {e}", None
 
-    log.info("chrome: spawned pid=%s exe=%s port=%s headless=%s",
-             proc.pid, exe, port, headless)
+    log.info("chrome: spawned pid=%s exe=%s port=%s headless=%s", proc.pid, exe, port, headless)
 
-    deadline = time.time() + 30.0   # bumped from 20 — cold containers need time
+    deadline = time.time() + 30.0
     last_state = "no response"
     while time.time() < deadline:
         if proc.poll() is not None:
-            return (False, port,
-                    f"Chromium exited early (code {proc.returncode}). "
-                    f"Common cause: missing shared library. Run in the container:\n"
-                    f"  {exe} --remote-debugging-port=9222 --no-sandbox "
-                    f"--headless=new --user-data-dir=/tmp/x about:blank\n"
-                    f"to see the stderr.", proc)
+            return (
+                False,
+                port,
+                f"Chromium exited early (code {proc.returncode}). "
+                f"Common cause: missing shared library. Run in the container:\n"
+                f"  {exe} --remote-debugging-port=9222 --no-sandbox "
+                f"--headless=new --user-data-dir=/tmp/x about:blank\n"
+                f"to see the stderr.",
+                proc,
+            )
         if _port_open(port):
             info = _cdp_version(port)
             if info and "Browser" in info:
@@ -185,6 +200,10 @@ def launch(profile_dir, force_port=None):
             last_state = "port closed"
         time.sleep(0.4)
 
-    return (False, port,
-            f"Chromium alive (pid {proc.pid}) but :{port} never opened. "
-            f"Last state: {last_state}. Check docker logs.", proc)
+    return (
+        False,
+        port,
+        f"Chromium alive (pid {proc.pid}) but :{port} never opened. "
+        f"Last state: {last_state}. Check docker logs.",
+        proc,
+    )
